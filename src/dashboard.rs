@@ -11,11 +11,11 @@ use crate::presentation::{Cell, DisplayLine, present};
 use crate::telemetry::{Reading, Snapshot, TelemetrySession, UnavailableReason};
 
 const STYLE: &str = r#"
-.dashboard { padding: 8px 16px 16px; }
-.metric-cell { min-height: 5.2em; padding-top: 0.8em; border-bottom: 1px solid alpha(@window_fg_color, 0.13); }
+.dashboard { padding: 4px 8px 8px; }
+.metric-cell { min-height: 3.5em; padding-top: 0.2em; border-bottom: 1px solid alpha(@window_fg_color, 0.13); }
 .metric-left { border-right: 1px solid alpha(@window_fg_color, 0.13); }
-.metric-glyph { color: @window_fg_color; font-size: 1.15em; min-width: 1.4em; }
-.metric-name { color: alpha(@window_fg_color, 0.75); font-size: 0.85em; font-weight: 600; min-width: 8em; }
+.metric-glyph { color: @window_fg_color; font-size: 1.15em; min-width: 1.2em; }
+.metric-name { color: alpha(@window_fg_color, 0.75); font-size: 0.85em; font-weight: 600; min-width: 7em; }
 .metric-value { color: @window_fg_color; font-size: 1.45em; font-weight: 700; font-feature-settings: "tnum"; }
 .metric-missing { color: alpha(@window_fg_color, 0.62); font-size: 1em; font-weight: 500; }
 .metric-rail { margin-top: 2px; min-height: 3px; }
@@ -67,12 +67,11 @@ impl CellWidget {
             self.body.remove(&child);
         }
         let grid = gtk::Grid::new();
-        grid.set_column_spacing(7);
+        grid.set_column_spacing(5);
         grid.set_row_spacing(2);
         grid.set_hexpand(true);
-        grid.set_vexpand(true);
-        grid.set_margin_start(14);
-        grid.set_margin_end(14);
+        grid.set_margin_start(8);
+        grid.set_margin_end(8);
 
         let icon = gtk::Label::new(Some(glyph(cell.glyph)));
         icon.add_css_class("metric-glyph");
@@ -101,6 +100,12 @@ impl CellWidget {
                 ]);
                 rails.push(rail);
             }
+        }
+        let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        spacer.set_vexpand(true);
+        self.body.append(&spacer);
+        if rails.is_empty() {
+            grid.set_margin_bottom(4);
         }
         self.body.append(&grid);
         for rail in rails {
@@ -153,10 +158,10 @@ fn build_window(app: &adw::Application, fixture: Option<&Snapshot>) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("sys-mon")
-        .default_width(860)
-        .default_height(540)
+        .default_width(520)
+        .default_height(390)
         .build();
-    window.set_size_request(700, 490);
+    window.set_size_request(520, -1);
 
     let layout = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let header = adw::HeaderBar::new();
@@ -167,7 +172,7 @@ fn build_window(app: &adw::Application, fixture: Option<&Snapshot>) {
     grid.set_column_homogeneous(true);
     grid.add_css_class("dashboard");
     grid.set_hexpand(true);
-    grid.set_vexpand(true);
+    grid.set_vexpand(false);
     let widgets: Rc<Vec<CellWidget>> =
         Rc::new((0..12).map(|i| CellWidget::new(i % 2 == 0)).collect());
     for (index, widget) in widgets.iter().enumerate() {
