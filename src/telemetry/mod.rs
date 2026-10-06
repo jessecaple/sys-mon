@@ -276,9 +276,30 @@ pub trait Provider: Send + 'static {
     }
 }
 
+/// Injected monotonic elapsed time for deterministic source and resume tests.
+/// A test clock waiting for a step must return `None` when stopped.
+pub trait Clock: Send + Sync + 'static {
+    fn elapsed(&self, stop: &StopToken) -> Option<Duration>;
+}
+
+struct SystemClock(Instant);
+
+impl Clock for SystemClock {
+    fn elapsed(&self, _stop: &StopToken) -> Option<Duration> {
+        Some(self.0.elapsed())
+    }
+}
+
+struct RegisteredProvider {
+    provider: Box<dyn Provider>,
+    kind: ProviderKind,
+    interval: Duration,
+}
+
 #[derive(Default)]
 pub struct SessionBuilder {
-    providers: Vec<Box<dyn Provider>>,
+    providers: Vec<RegisteredProvider>,
+    clock: Option<Arc<dyn Clock>>,
 }
 
 impl SessionBuilder {
@@ -286,51 +307,71 @@ impl SessionBuilder {
         Self::default()
     }
 
+    pub fn with_clock<C: Clock>(&mut self, clock: C) -> &mut Self {
+        self.clock = Some(Arc::new(clock));
+        self
+    }
+
     pub fn register<P: Provider>(&mut self, provider: P) -> io::Result<&mut Self> {
-        if provider.interval() < Duration::from_millis(10) {
+        // Cache the value being validated. A provider can otherwise change its
+        // answer between registration and start, reopening a zero-delay loop.
+        let interval = provider.interval();
+        if interval < Duration::from_millis(10) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "provider interval must be at least 10 ms",
             ));
         }
-        if self
-            .providers
-            .iter()
-            .any(|existing| existing.kind() == provider.kind())
-        {
+        let kind = provider.kind();
+        if self.providers.iter().any(|existing| existing.kind == kind) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "provider kind already registered",
             ));
         }
-        self.providers.push(Box::new(provider));
+        self.providers.push(RegisteredProvider {
+            provider: Box::new(provider),
+            kind,
+            interval,
+        });
         Ok(self)
     }
 
     pub fn start(self) -> io::Result<TelemetrySession> {
+        let Self { providers, clock } = self;
         let state = Arc::new(Mutex::new(SnapshotState {
             active: true,
             generation: 1,
             latest: Snapshot::default(),
         }));
         let stop = StopToken::new();
-        let started = Instant::now();
+        let clock: Arc<dyn Clock> = clock.unwrap_or_else(|| Arc::new(SystemClock(Instant::now())));
         let mut session = TelemetrySession {
             state,
             stop,
             workers: Vec::new(),
         };
-        for mut provider in self.providers {
-            let kind = provider.kind();
-            let interval = provider.interval();
+        for RegisteredProvider {
+            mut provider,
+            kind,
+            interval,
+        } in providers
+        {
             let state = Arc::clone(&session.state);
             let stop = session.stop.clone();
+            let clock = Arc::clone(&clock);
             let worker = thread::Builder::new()
                 .name(format!("sys-mon-{kind:?}").to_lowercase())
                 .spawn(move || {
                     while !stop.is_stopped() {
+                        let Some(elapsed) = clock.elapsed(&stop) else {
+                            break;
+                        };
+                        if stop.is_stopped() {
+                            break;
+                        }
                         let patch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            provider.sample(started.elapsed(), &stop)
+                            provider.sample(elapsed, &stop)
                         }))
                         .unwrap_or_else(|_| {
                             Patch::unavailable(kind, UnavailableReason::SourceError)
