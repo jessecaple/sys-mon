@@ -8,12 +8,15 @@ use super::{
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const MAX_INTERVAL: Duration = Duration::from_secs(10);
+const CAPACITY_OUTPUT_LIMIT: u64 = 8192;
 
 #[derive(Clone, Copy)]
 struct Counters {
@@ -77,10 +80,20 @@ struct VolumeFrame {
 trait IoProbe: Send + 'static {
     fn network(&mut self) -> io::Result<NetworkFrame>;
     fn block(&mut self) -> io::Result<Vec<BlockDevice>>;
-    fn volumes(&mut self) -> io::Result<VolumeFrame>;
+    fn capacity(&mut self) -> Reading<Vec<PrimaryVolume>>;
 }
 
-struct LinuxIoProbe;
+struct LinuxIoProbe {
+    capacity: CapacityHelper,
+}
+
+impl LinuxIoProbe {
+    fn new() -> Self {
+        Self {
+            capacity: CapacityHelper::system(),
+        }
+    }
+}
 
 impl IoProbe for LinuxIoProbe {
     fn network(&mut self) -> io::Result<NetworkFrame> {
@@ -172,16 +185,197 @@ impl IoProbe for LinuxIoProbe {
         Ok(devices)
     }
 
-    fn volumes(&mut self) -> io::Result<VolumeFrame> {
-        let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
-        let root = open_volume("/", &mountinfo).map_err(|error| reason_for_io(&error));
-        let home = open_volume("/home", &mountinfo).map_err(|error| reason_for_io(&error));
-        Ok(VolumeFrame {
-            mountinfo,
-            root,
-            home,
-        })
+    fn capacity(&mut self) -> Reading<Vec<PrimaryVolume>> {
+        self.capacity.sample()
     }
+}
+
+fn read_volume_frame() -> io::Result<VolumeFrame> {
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+    let root = open_volume("/", &mountinfo).map_err(|error| reason_for_io(&error));
+    let home = open_volume("/home", &mountinfo).map_err(|error| reason_for_io(&error));
+    Ok(VolumeFrame {
+        mountinfo,
+        root,
+        home,
+    })
+}
+
+/// Only the helper process performs potentially blocking pathname and mount
+/// operations. The I/O worker retains at most one child that could not be
+/// reaped promptly, and never launches another until it has exited.
+struct CapacityHelper {
+    executable: Option<PathBuf>,
+    timeout: Duration,
+    unreaped: Option<Child>,
+}
+
+impl CapacityHelper {
+    fn system() -> Self {
+        Self {
+            executable: std::env::current_exe().ok(),
+            timeout: Duration::from_millis(650),
+            unreaped: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_executable(executable: PathBuf, timeout: Duration) -> Self {
+        Self {
+            executable: Some(executable),
+            timeout,
+            unreaped: None,
+        }
+    }
+
+    fn reap_previous(&mut self) -> bool {
+        let Some(child) = self.unreaped.as_mut() else {
+            return true;
+        };
+        let _ = child.kill();
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                self.unreaped = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn terminate(&mut self, mut child: Child) {
+        let _ = child.kill();
+        let reap_started = Instant::now();
+        loop {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            if reap_started.elapsed() >= Duration::from_millis(100) {
+                self.unreaped = Some(child);
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn sample(&mut self) -> Reading<Vec<PrimaryVolume>> {
+        if !self.reap_previous() {
+            return Reading::Unavailable(UnavailableReason::TimedOut);
+        }
+        let Some(executable) = &self.executable else {
+            return Reading::Unavailable(UnavailableReason::SourceError);
+        };
+        let mut child = match Command::new(executable)
+            .arg("--internal-capacity-probe")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => return Reading::Unavailable(reason_for_io(&error)),
+        };
+        let Some(stdout) = child.stdout.as_mut() else {
+            self.terminate(child);
+            return Reading::Unavailable(UnavailableReason::SourceError);
+        };
+        // A helper can fill its pipe before exiting. Drain without blocking so
+        // oversized or stalled output cannot turn the timeout into a deadlock.
+        let fd = stdout.as_raw_fd();
+        // SAFETY: fd belongs to this live child stdout; fcntl only changes its
+        // file status flags and does not retain the descriptor.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            self.terminate(child);
+            return Reading::Unavailable(UnavailableReason::SourceError);
+        }
+        let started = Instant::now();
+        let mut output = Vec::new();
+        let mut eof = false;
+        let mut status = None;
+        loop {
+            if !eof {
+                let mut buffer = [0_u8; 4096];
+                match child.stdout.as_mut().unwrap().read(&mut buffer) {
+                    Ok(0) => eof = true,
+                    Ok(count) => {
+                        output.extend_from_slice(&buffer[..count]);
+                        if output.len() as u64 > CAPACITY_OUTPUT_LIMIT {
+                            self.terminate(child);
+                            return Reading::Unavailable(UnavailableReason::InvalidData);
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(_) => {
+                        self.terminate(child);
+                        return Reading::Unavailable(UnavailableReason::SourceError);
+                    }
+                }
+            }
+            if status.is_none() {
+                match child.try_wait() {
+                    Ok(result) => status = result,
+                    Err(_) => {
+                        self.terminate(child);
+                        return Reading::Unavailable(UnavailableReason::SourceError);
+                    }
+                }
+            }
+            if eof && let Some(status) = status {
+                if !status.success() {
+                    return Reading::Unavailable(UnavailableReason::SourceError);
+                }
+                return serde_json::from_slice(&output)
+                    .map(validate_capacity)
+                    .unwrap_or(Reading::Unavailable(UnavailableReason::InvalidData));
+            }
+            if started.elapsed() >= self.timeout {
+                self.terminate(child);
+                return Reading::Unavailable(UnavailableReason::TimedOut);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+impl Drop for CapacityHelper {
+    fn drop(&mut self) {
+        if let Some(child) = self.unreaped.as_mut() {
+            let _ = child.kill();
+            let _ = child.try_wait();
+        }
+    }
+}
+
+fn validate_capacity(reading: Reading<Vec<PrimaryVolume>>) -> Reading<Vec<PrimaryVolume>> {
+    let Reading::Value(volumes) = reading else {
+        return reading;
+    };
+    let mut paths = HashSet::new();
+    if volumes.is_empty()
+        || volumes.len() > 2
+        || volumes.iter().any(|volume| {
+            volume.paths.is_empty()
+                || volume.total_bytes == 0
+                || volume.used_bytes > volume.total_bytes
+                || volume.available_bytes > volume.total_bytes
+                || volume
+                    .paths
+                    .iter()
+                    .any(|path| !matches!(path.as_str(), "/" | "/home") || !paths.insert(path))
+        })
+    {
+        Reading::Unavailable(UnavailableReason::InvalidData)
+    } else {
+        Reading::Value(volumes)
+    }
+}
+
+pub fn run_capacity_helper() -> io::Result<()> {
+    let reading = match read_volume_frame() {
+        Ok(frame) => primary_volumes(frame),
+        Err(error) => Reading::Unavailable(reason_for_io(&error)),
+    };
+    serde_json::to_writer(io::stdout().lock(), &reading)?;
+    io::stdout().flush()
 }
 
 fn read_number(path: PathBuf) -> io::Result<u32> {
@@ -554,7 +748,7 @@ pub(super) struct IoSampler {
 
 impl IoSampler {
     pub(super) fn system() -> Self {
-        Self::new(LinuxIoProbe)
+        Self::new(LinuxIoProbe::new())
     }
 
     fn new(probe: impl IoProbe) -> Self {
@@ -568,10 +762,7 @@ impl IoSampler {
     fn tick(&mut self, elapsed: Duration) -> IoPatch {
         let network = self.network(elapsed);
         let (read_bytes_per_second, write_bytes_per_second) = self.block(elapsed);
-        let primary_volumes = match self.probe.volumes() {
-            Ok(frame) => primary_volumes(frame),
-            Err(error) => Reading::Unavailable(reason_for_io(&error)),
-        };
+        let primary_volumes = self.probe.capacity();
         IoPatch {
             network,
             storage: StorageSnapshot {
@@ -727,8 +918,11 @@ mod tests {
         fn block(&mut self) -> io::Result<Vec<BlockDevice>> {
             self.block.pop_front().expect("block frame")
         }
-        fn volumes(&mut self) -> io::Result<VolumeFrame> {
-            self.volumes.pop_front().expect("volume frame")
+        fn capacity(&mut self) -> Reading<Vec<PrimaryVolume>> {
+            match self.volumes.pop_front().expect("volume frame") {
+                Ok(frame) => primary_volumes(frame),
+                Err(error) => Reading::Unavailable(reason_for_io(&error)),
+            }
         }
     }
 
@@ -1104,8 +1298,8 @@ mod tests {
                 )])
             }
 
-            fn volumes(&mut self) -> io::Result<VolumeFrame> {
-                Ok(mounts(43, 63, "/dev/nvme0n1p3", "0:35"))
+            fn capacity(&mut self) -> Reading<Vec<PrimaryVolume>> {
+                primary_volumes(mounts(43, 63, "/dev/nvme0n1p3", "0:35"))
             }
         }
 
@@ -1124,6 +1318,155 @@ mod tests {
             assert!(matches!(patch.storage.primary_volumes, Reading::Value(_)));
         }
         assert!(sampler.block_previous.is_empty());
+    }
+
+    #[test]
+    fn capacity_helper_rejects_bad_output_and_recovers_without_erasing_rates() {
+        struct HelperProbe {
+            helper: CapacityHelper,
+            sample: u64,
+        }
+
+        impl IoProbe for HelperProbe {
+            fn network(&mut self) -> io::Result<NetworkFrame> {
+                Ok(network_frame(
+                    "eno2",
+                    (self.sample * 100, self.sample * 200),
+                    (0, 0),
+                ))
+            }
+
+            fn block(&mut self) -> io::Result<Vec<BlockDevice>> {
+                let sample = self.sample;
+                self.sample += 1;
+                Ok(minimal_blocks(sample * 100, sample * 200))
+            }
+
+            fn capacity(&mut self) -> Reading<Vec<PrimaryVolume>> {
+                self.helper.sample()
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "sys-mon-capacity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let script = root.join("helper.sh");
+        let payload = root.join("payload");
+        fs::write(&script, format!("#!/bin/sh\ncat '{}'\n", payload.display())).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let good = Reading::Value(vec![PrimaryVolume {
+            paths: vec!["/".into(), "/home".into()],
+            available_bytes: 20,
+            used_bytes: 70,
+            total_bytes: 100,
+        }]);
+        fs::write(&payload, serde_json::to_vec(&good).unwrap()).unwrap();
+        let mut sampler = IoSampler::new(HelperProbe {
+            helper: CapacityHelper::with_executable(script, Duration::from_millis(200)),
+            sample: 0,
+        });
+        assert_eq!(sampler.tick(Duration::ZERO).storage.primary_volumes, good);
+
+        fs::write(&payload, "not json").unwrap();
+        let malformed = sampler.tick(Duration::from_secs(1));
+        assert_eq!(
+            malformed.storage.primary_volumes,
+            Reading::Unavailable(UnavailableReason::InvalidData)
+        );
+        assert_eq!(
+            malformed.storage.read_bytes_per_second,
+            Reading::Value(100.0)
+        );
+        assert_eq!(
+            malformed.network.down_bytes_per_second,
+            Reading::Value(100.0)
+        );
+
+        fs::write(&payload, vec![b'x'; CAPACITY_OUTPUT_LIMIT as usize + 1]).unwrap();
+        let oversized = sampler.tick(Duration::from_secs(2));
+        assert_eq!(
+            oversized.storage.primary_volumes,
+            Reading::Unavailable(UnavailableReason::InvalidData)
+        );
+        assert_eq!(
+            oversized.storage.write_bytes_per_second,
+            Reading::Value(200.0)
+        );
+
+        fs::write(&payload, serde_json::to_vec(&good).unwrap()).unwrap();
+        let recovered = sampler.tick(Duration::from_secs(3));
+        assert_eq!(recovered.storage.primary_volumes, good);
+        assert_eq!(
+            recovered.storage.read_bytes_per_second,
+            Reading::Value(100.0)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stalled_capacity_helper_is_killed_when_session_stops() {
+        let root = std::env::temp_dir().join(format!(
+            "sys-mon-capacity-stall-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let script = root.join("helper.sh");
+        let pid_path = root.join("pid");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec sleep 30\n",
+                pid_path.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut builder = SessionBuilder::new();
+        builder
+            .register(IoSampler::new(HelperProbeForStop {
+                helper: CapacityHelper::with_executable(script, Duration::from_millis(300)),
+            }))
+            .unwrap();
+        let mut session = builder.start().unwrap();
+        let started = Instant::now();
+        while !pid_path.exists() {
+            assert!(started.elapsed() < Duration::from_secs(2));
+            thread::sleep(Duration::from_millis(2));
+        }
+        let pid = fs::read_to_string(&pid_path).unwrap();
+        let stopped_at = Instant::now();
+        session.stop();
+        assert!(stopped_at.elapsed() < Duration::from_secs(1));
+        assert!(!PathBuf::from(format!("/proc/{pid}")).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    struct HelperProbeForStop {
+        helper: CapacityHelper,
+    }
+
+    impl IoProbe for HelperProbeForStop {
+        fn network(&mut self) -> io::Result<NetworkFrame> {
+            Ok(network_frame("eno2", (0, 0), (0, 0)))
+        }
+
+        fn block(&mut self) -> io::Result<Vec<BlockDevice>> {
+            Ok(minimal_blocks(0, 0))
+        }
+
+        fn capacity(&mut self) -> Reading<Vec<PrimaryVolume>> {
+            self.helper.sample()
+        }
     }
 
     #[test]
@@ -1410,7 +1753,7 @@ mod tests {
             let number = *self.ticks.lock().unwrap();
             Ok(minimal_blocks(number * 512, number * 1024))
         }
-        fn volumes(&mut self) -> io::Result<VolumeFrame> {
+        fn capacity(&mut self) -> Reading<Vec<PrimaryVolume>> {
             let mode = self.volume_mode.load(Ordering::SeqCst);
             let mut frame = if mode == 0 || mode == 4 {
                 mounts(43, 63, "/dev/nvme0n1p3", "0:35")
@@ -1431,7 +1774,7 @@ mod tests {
                 frame.root = Err(UnavailableReason::PermissionDenied);
                 numbers_mut(&mut frame.home).available = 5;
             }
-            Ok(frame)
+            primary_volumes(frame)
         }
     }
 
