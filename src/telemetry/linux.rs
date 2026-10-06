@@ -659,6 +659,34 @@ mod tests {
     }
 
     #[test]
+    fn repeated_sensor_arrival_and_removal_never_reuses_an_old_reading() {
+        let root = fixture_root("churn");
+        for cycle in 0..128 {
+            let value = 40_000 + cycle;
+            channel(
+                &root,
+                "hwmon0",
+                "coretemp",
+                1,
+                "Package id 0",
+                value,
+                None,
+                None,
+            );
+            assert_eq!(
+                scan_cpu_temperature(&root)
+                    .unwrap()
+                    .unwrap()
+                    .millidegrees_celsius,
+                value
+            );
+            fs::remove_dir_all(root.join("hwmon0")).unwrap();
+            assert!(scan_cpu_temperature(&root).unwrap().is_none());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn guest_fields_are_not_double_counted() {
         let first = CpuCounters::parse("cpu 100 0 0 100 0 0 0 0 50 0\n").unwrap();
         let second = CpuCounters::parse("cpu 150 0 0 150 0 0 0 0 100 0\n").unwrap();
