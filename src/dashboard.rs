@@ -11,16 +11,24 @@ use crate::presentation::{Cell, DisplayLine, present};
 use crate::telemetry::{Reading, Snapshot, TelemetrySession, UnavailableReason};
 
 const STYLE: &str = r#"
+.compact-titlebar { min-height: 30px; padding: 0 4px; border-bottom: 1px solid alpha(@window_fg_color, 0.13); }
+.compact-titlebar .title { color: alpha(@window_fg_color, 0.68); font-size: 0.9em; font-weight: 600; }
+.compact-titlebar windowcontrols { margin: 0; padding: 0; }
+.compact-titlebar windowcontrols button { min-width: 24px; min-height: 24px; margin: 0; padding: 0; }
 .dashboard { padding: 4px 8px 8px; }
-.metric-cell { min-height: 3.5em; padding-top: 0.2em; border-bottom: 1px solid alpha(@window_fg_color, 0.13); }
+.metric-cell { min-height: 2.8em; padding-top: 0.2em; border-bottom: 1px solid alpha(@window_fg_color, 0.13); }
 .metric-left { border-right: 1px solid alpha(@window_fg_color, 0.13); }
+.metric-first-row { min-height: 2.2em; padding-top: 0; }
+.metric-last-row { border-bottom: none; }
+.metric-last-row.metric-left { border-right: none; }
 .metric-glyph { color: @window_fg_color; font-size: 1.15em; min-width: 1.2em; }
 .metric-name { color: alpha(@window_fg_color, 0.75); font-size: 0.85em; font-weight: 600; min-width: 7em; }
-.metric-value { color: @window_fg_color; font-size: 1.45em; font-weight: 700; font-feature-settings: "tnum"; }
+.metric-value { color: @window_fg_color; font-size: 1.45em; font-weight: 600; font-feature-settings: "tnum"; }
 .metric-missing { color: alpha(@window_fg_color, 0.62); font-size: 1em; font-weight: 500; }
 .metric-rail { margin-top: 2px; min-height: 3px; }
 .metric-rail trough { min-height: 3px; border-radius: 0; background: alpha(@window_fg_color, 0.18); }
 .metric-rail progress { min-height: 3px; border-radius: 0; background: @window_fg_color; }
+.metric-empty-rail { margin-top: 2px; min-height: 3px; background: alpha(@window_fg_color, 0.18); }
 "#;
 
 fn glyph(name: &str) -> &'static str {
@@ -43,19 +51,27 @@ fn glyph(name: &str) -> &'static str {
 struct CellWidget {
     body: gtk::Box,
     last: RefCell<Option<Cell>>,
+    show_empty_rail: bool,
 }
 
 impl CellWidget {
-    fn new(left: bool) -> Self {
+    fn new(index: usize) -> Self {
         let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
         body.add_css_class("metric-cell");
-        if left {
+        if index % 2 == 0 {
             body.add_css_class("metric-left");
+        }
+        if index < 2 {
+            body.add_css_class("metric-first-row");
+        }
+        if index >= 10 {
+            body.add_css_class("metric-last-row");
         }
         body.set_hexpand(true);
         Self {
             body,
             last: RefCell::new(None),
+            show_empty_rail: index == 8 || index == 9,
         }
     }
 
@@ -104,11 +120,18 @@ impl CellWidget {
         let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
         spacer.set_vexpand(true);
         self.body.append(&spacer);
-        if rails.is_empty() {
+        let show_empty_rail = self.show_empty_rail && rails.is_empty();
+        if rails.is_empty() && !show_empty_rail {
             grid.set_margin_bottom(4);
         }
         self.body.append(&grid);
         for rail in rails {
+            self.body.append(&rail);
+        }
+        if show_empty_rail {
+            let rail = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            rail.add_css_class("metric-empty-rail");
+            rail.set_accessible_role(gtk::AccessibleRole::Presentation);
             self.body.append(&rail);
         }
         *self.last.borrow_mut() = Some(cell.clone());
@@ -157,24 +180,30 @@ fn build_window(app: &adw::Application, fixture: Option<&Snapshot>) {
     install_style();
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("sys-mon")
+        .title("SysMon")
         .default_width(520)
-        .default_height(390)
+        .default_height(290)
         .build();
-    window.set_size_request(520, -1);
+    window.set_size_request(520, 290);
 
     let layout = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let header = adw::HeaderBar::new();
-    header.set_show_title(false);
-    layout.append(&header);
+    let header_handle = gtk::WindowHandle::new();
+    let header = gtk::CenterBox::new();
+    header.add_css_class("compact-titlebar");
+    let title = gtk::Label::new(Some("SysMon"));
+    title.add_css_class("title");
+    header.set_center_widget(Some(&title));
+    header.set_start_widget(Some(&gtk::WindowControls::new(gtk::PackType::Start)));
+    header.set_end_widget(Some(&gtk::WindowControls::new(gtk::PackType::End)));
+    header_handle.set_child(Some(&header));
+    layout.append(&header_handle);
 
     let grid = gtk::Grid::new();
     grid.set_column_homogeneous(true);
     grid.add_css_class("dashboard");
     grid.set_hexpand(true);
     grid.set_vexpand(false);
-    let widgets: Rc<Vec<CellWidget>> =
-        Rc::new((0..12).map(|i| CellWidget::new(i % 2 == 0)).collect());
+    let widgets: Rc<Vec<CellWidget>> = Rc::new((0..12).map(CellWidget::new).collect());
     for (index, widget) in widgets.iter().enumerate() {
         grid.attach(&widget.body, (index % 2) as i32, (index / 2) as i32, 1, 1);
     }
