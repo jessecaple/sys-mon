@@ -183,6 +183,7 @@ fn reason_for_io(error: &io::Error) -> UnavailableReason {
 pub struct TemperatureProvider {
     executable: PathBuf,
     timeout: Duration,
+    interval: Duration,
     unreaped: Option<Child>,
 }
 
@@ -200,8 +201,14 @@ impl TemperatureProvider {
         Self {
             executable,
             timeout,
+            interval: Duration::from_secs(1),
             unreaped: None,
         }
+    }
+
+    pub fn with_interval(mut self, interval: Duration) -> Self {
+        self.interval = interval;
+        self
     }
 
     fn reap_previous(&mut self) -> bool {
@@ -288,6 +295,10 @@ impl Provider for TemperatureProvider {
 
     fn sample(&mut self, _elapsed: Duration, stop: &StopToken) -> Patch {
         Patch::Temperature(self.read(stop))
+    }
+
+    fn interval(&self) -> Duration {
+        self.interval
     }
 }
 

@@ -3,14 +3,14 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sys_mon::telemetry::{
-    GpuPatch, HostPatch, HostProbe, HostSampler, IoPatch, MemoryAmount, NetworkSnapshot, Patch,
-    PrimaryVolume, Provider, ProviderKind, Reading, SessionBuilder, StopToken, StorageSnapshot,
-    TemperatureProvider, UnavailableReason,
+    Clock, GpuPatch, HostPatch, HostProbe, HostSampler, IoPatch, MemoryAmount, NetworkSnapshot,
+    Patch, PrimaryVolume, Provider, ProviderKind, Reading, SessionBuilder, StopToken,
+    StorageSnapshot, TemperatureProvider, UnavailableReason,
 };
 
 struct Frames {
@@ -248,6 +248,107 @@ fn controlled_proc_sources_flow_through_public_session_snapshot() {
     session.stop();
 }
 
+struct ScriptClock(Mutex<mpsc::Receiver<Duration>>);
+
+impl Clock for ScriptClock {
+    fn elapsed(&self, stop: &StopToken) -> Option<Duration> {
+        loop {
+            if stop.is_stopped() {
+                return None;
+            }
+            match self
+                .0
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_millis(5))
+            {
+                Ok(value) => return Some(value),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+            }
+        }
+    }
+}
+
+struct SteppedHost {
+    sample: usize,
+}
+
+impl HostProbe for SteppedHost {
+    fn read_stat(&mut self) -> io::Result<String> {
+        self.sample += 1;
+        let (user, idle) = match self.sample {
+            1 => (100, 100),
+            2 => (150, 150),
+            3 => (160, 160),
+            4 => (170, 170),
+            _ => (180, 180),
+        };
+        Ok(stat(user, idle, 0, 0))
+    }
+    fn read_meminfo(&mut self) -> io::Result<String> {
+        if self.sample == 3 {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        } else {
+            Ok(mem(100, 40, 10, 5))
+        }
+    }
+}
+
+struct SteppedProvider(HostSampler<SteppedHost>);
+
+impl Provider for SteppedProvider {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Host
+    }
+    fn sample(&mut self, elapsed: Duration, _stop: &StopToken) -> Patch {
+        Patch::Host(self.0.tick(elapsed))
+    }
+    fn interval(&self) -> Duration {
+        Duration::from_millis(10)
+    }
+}
+
+#[test]
+fn injected_elapsed_time_and_source_failures_recover_in_public_snapshots() {
+    let (time_tx, time_rx) = mpsc::channel();
+    let mut builder = SessionBuilder::new();
+    builder.with_clock(ScriptClock(Mutex::new(time_rx)));
+    builder
+        .register(SteppedProvider(HostSampler::new(SteppedHost { sample: 0 })))
+        .unwrap();
+    let mut session = builder.start().unwrap();
+    time_tx.send(Duration::ZERO).unwrap();
+    wait_until(|| {
+        session.snapshot().cpu.usage_percent == Reading::Unavailable(UnavailableReason::WarmingUp)
+    });
+    time_tx.send(Duration::from_secs(1)).unwrap();
+    wait_until(|| session.snapshot().cpu.usage_percent == Reading::Value(50.0));
+    time_tx.send(Duration::from_secs(1)).unwrap();
+    wait_until(|| {
+        session.snapshot().ram == Reading::Unavailable(UnavailableReason::PermissionDenied)
+    });
+    assert_eq!(
+        session.snapshot().cpu.usage_percent,
+        Reading::Unavailable(UnavailableReason::InvalidData)
+    );
+    time_tx.send(Duration::from_secs(30)).unwrap();
+    wait_until(|| {
+        session.snapshot().ram
+            == Reading::Value(MemoryAmount {
+                used_bytes: 60 * 1024,
+                total_bytes: 100 * 1024,
+            })
+    });
+    assert_eq!(
+        session.snapshot().cpu.usage_percent,
+        Reading::Unavailable(UnavailableReason::InvalidData)
+    );
+    time_tx.send(Duration::from_secs(31)).unwrap();
+    wait_until(|| session.snapshot().cpu.usage_percent == Reading::Value(50.0));
+    session.stop(); // clock is waiting for another step; stop must wake it
+}
+
 #[test]
 fn zero_or_tiny_provider_interval_is_rejected_before_spawning() {
     for interval in [Duration::ZERO, Duration::from_millis(1)] {
@@ -264,6 +365,48 @@ fn zero_or_tiny_provider_interval_is_rejected_before_spawning() {
         };
         assert!(SessionBuilder::new().register(provider).is_err());
     }
+}
+
+struct ChangingInterval {
+    calls: Arc<AtomicUsize>,
+    ticks: Arc<AtomicUsize>,
+}
+impl Provider for ChangingInterval {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Host
+    }
+    fn sample(&mut self, _elapsed: Duration, _stop: &StopToken) -> Patch {
+        self.ticks.fetch_add(1, Ordering::SeqCst);
+        Patch::Host(HostPatch {
+            cpu_usage_percent: Reading::Value(1.0),
+            ram: Reading::Unavailable(UnavailableReason::Missing),
+            swap: Reading::Unavailable(UnavailableReason::Missing),
+        })
+    }
+    fn interval(&self) -> Duration {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Duration::from_millis(10)
+        } else {
+            Duration::ZERO
+        }
+    }
+}
+
+#[test]
+fn registration_uses_the_exact_interval_it_validated() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let ticks = Arc::new(AtomicUsize::new(0));
+    let mut builder = SessionBuilder::new();
+    builder
+        .register(ChangingInterval {
+            calls: Arc::clone(&calls),
+            ticks: Arc::clone(&ticks),
+        })
+        .unwrap();
+    let mut session = builder.start().unwrap();
+    wait_until(|| ticks.load(Ordering::SeqCst) >= 3);
+    session.stop();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -435,6 +578,70 @@ fn unreleased_temperature_helper_does_not_stall_host_or_shutdown() {
         "owned helper was not reaped"
     );
     fs::remove_dir_all(temp_root).unwrap();
+}
+
+#[test]
+fn temperature_helper_churn_flows_through_public_snapshot_without_stale_state() {
+    let root = temp_path("sensor-churn");
+    fs::create_dir_all(&root).unwrap();
+    let script = root.join("helper.sh");
+    let present = root.join("present");
+    let pids = root.join("pids");
+    fs::write(&script, format!("#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\nif test -f '{}'; then\n  printf 'V1\\t50000\\tmax\\t80000\\tcoretemp Package id 0\\n'\nelse\n  printf 'U\\n'\nfi\n", pids.display(), present.display())).unwrap();
+    let mut permissions = fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&script, permissions).unwrap();
+    let ticks = Arc::new(AtomicUsize::new(0));
+    let host = RepeatingProvider {
+        kind: ProviderKind::Host,
+        patch: Patch::Host(HostPatch {
+            cpu_usage_percent: Reading::Value(7.0),
+            ram: Reading::Unavailable(UnavailableReason::Missing),
+            swap: Reading::Unavailable(UnavailableReason::Missing),
+        }),
+        ticks: Arc::clone(&ticks),
+        interval: Duration::from_millis(10),
+        work: Duration::ZERO,
+    };
+    let mut builder = SessionBuilder::new();
+    builder.register(host).unwrap();
+    builder
+        .register(
+            TemperatureProvider::with_executable(script, Duration::from_millis(200))
+                .with_interval(Duration::from_millis(10)),
+        )
+        .unwrap();
+    let mut session = builder.start().unwrap();
+    wait_until(|| {
+        session.snapshot().cpu.temperature == Reading::Unavailable(UnavailableReason::Missing)
+    });
+    for _ in 0..32 {
+        fs::write(&present, "yes").unwrap();
+        wait_until(|| matches!(session.snapshot().cpu.temperature, Reading::Value(_)));
+        assert_eq!(session.snapshot().cpu.usage_percent, Reading::Value(7.0));
+        fs::remove_file(&present).unwrap();
+        wait_until(|| {
+            session.snapshot().cpu.temperature == Reading::Unavailable(UnavailableReason::Missing)
+        });
+    }
+    session.stop();
+    assert!(
+        ticks.load(Ordering::SeqCst) >= 64,
+        "host must keep updating through sensor churn"
+    );
+    let recorded = fs::read_to_string(&pids).unwrap();
+    let helper_pids: Vec<_> = recorded.lines().collect();
+    assert!(
+        helper_pids.len() >= 64,
+        "expected repeated bounded helper samples"
+    );
+    for pid in helper_pids {
+        assert!(
+            !PathBuf::from(format!("/proc/{pid}")).exists(),
+            "helper {pid} survived stop"
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
 }
 
 fn temp_path(label: &str) -> PathBuf {
