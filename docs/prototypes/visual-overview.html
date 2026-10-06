@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sys-mon current status — disposable prototype</title>
+  <style>
+    :root { color-scheme:light; --surface:#fff; --control:#f7f7f6; --ink:#202020; --label:#515151; --muted:#737373; --line:#e4e4e1; --track:#e7e7e4; --accent:#292929; font:15px/1.4 "Cantarell",system-ui,-apple-system,sans-serif; }
+    :root[data-theme="dark"] { color-scheme:dark; --surface:#191919; --control:#202020; --ink:#f1f1f1; --label:#c7c7c7; --muted:#949494; --line:#333333; --track:#3a3a3a; --accent:#ececec; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--surface); color:var(--ink); }
+    button { font:inherit; cursor:pointer; }
+    button:focus-visible { outline:3px solid var(--accent); outline-offset:2px; }
+    .prototype-controls { padding:12px 16px; background:var(--control); border-bottom:1px solid var(--line); }
+    .reference-capture .prototype-controls { display:none; }
+    .prototype-note { margin:0 0 8px; color:var(--muted); font-size:12px; }
+    .toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:9px 24px; }
+    .control { display:flex; flex-wrap:wrap; align-items:center; gap:7px; }
+    .control-label { color:var(--muted); font-size:12px; font-weight:700; }
+    .segmented { display:inline-flex; gap:2px; padding:3px; border-radius:7px; background:var(--track); }
+    .segmented button { border:0; border-radius:5px; padding:5px 9px; background:transparent; color:var(--muted); font-size:12px; }
+    .segmented button[aria-pressed="true"] { background:var(--surface); color:var(--ink); font-weight:700; box-shadow:0 1px 3px #0002; }
+    :root[data-theme="dark"] .segmented button[aria-pressed="true"] { background:#383838; box-shadow:none; }
+    .app-shell { width:100%; min-width:640px; }
+    .app-shell.minimum { width:640px; }
+    .app-body { padding:8px 16px 16px; }
+    .status-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); }
+    .status-row { position:relative; display:grid; align-content:center; min-height:76px; padding:14px 14px 16px; border-bottom:1px solid var(--line); }
+    .status-row:nth-child(odd) { border-right:1px solid var(--line); }
+    .status-main { display:grid; grid-template-columns:132px minmax(0,1fr); align-items:baseline; column-gap:10px; min-width:0; }
+    .status-label { display:inline-flex; align-items:center; gap:8px; color:var(--label); font-size:12.5px; font-weight:600; white-space:nowrap; }
+    .glyph { width:17px; height:17px; flex:none; align-self:center; color:var(--accent); fill:none; stroke:currentColor; stroke-width:1.75; stroke-linecap:round; stroke-linejoin:round; }
+    .status-value { color:var(--accent); font-family:system-ui,-apple-system,"Cantarell",sans-serif; font-size:22px; line-height:1.15; font-weight:700; font-variant-numeric:tabular-nums; letter-spacing:0; white-space:nowrap; }
+    .status-value.na { color:var(--muted); font-size:14px; font-weight:500; letter-spacing:0; }
+    .status-side { position:absolute; left:0; right:0; bottom:-1px; }
+    .fill { width:100%; height:3px; background:var(--track); overflow:hidden; }
+    .fill span { display:block; height:100%; background:var(--accent); }
+  </style>
+</head>
+<body>
+  <div class="prototype-controls">
+    <p class="prototype-note"><strong>Disposable prototype.</strong> Sample readings only. The real app is a native Rust GTK4/libadwaita window; these controls are for design review.</p>
+    <div class="toolbar" aria-label="Prototype controls">
+      <div class="control"><span class="control-label" id="width-label">Window</span><div class="segmented" role="group" aria-labelledby="width-label" id="width-control"></div></div>
+      <div class="control"><span class="control-label" id="data-label">Data</span><div class="segmented" role="group" aria-labelledby="data-label" id="data-control"></div></div>
+      <div class="control"><span class="control-label" id="theme-label">Theme</span><div class="segmented" role="group" aria-labelledby="theme-label" id="theme-control"></div></div>
+    </div>
+  </div>
+  <main class="app-shell" id="app-shell">
+    <div class="app-body" id="app-body"></div>
+  </main>
+  <script>
+    const params=new URLSearchParams(location.search);
+    if(params.get('reference')==='1')document.body.classList.add('reference-capture');
+    const choices={width:['wide','minimum'],data:['normal','unavailable'],theme:['system','light','dark']};
+    const labels={wide:'Wide',minimum:'Minimum',normal:'Normal',unavailable:'Missing readings',system:'System',light:'Light',dark:'Dark'};
+    const state=Object.fromEntries(Object.entries(choices).map(([key,values])=>[key,values.includes(params.get(key))?params.get(key):values[0]]));
+    function escapeHtml(value){return String(value).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+    function setChoice(key,value){state[key]=value;const url=new URL(location.href);url.searchParams.set(key,value);history.replaceState(null,'',url);render();}
+    function controls(key){document.getElementById(key+'-control').innerHTML=choices[key].map(value=>`<button type="button" aria-pressed="${state[key]===value}" data-key="${key}" data-value="${value}">${labels[value]}</button>`).join('');}
+    function fixture(){const missing=state.data==='unavailable';const cpuTempMax=80;const gpuTempTarget=84;return [
+      {id:'cpu',label:'CPU',value:'38%',fill:38},
+      {id:'temperature',label:'CPU temp',value:missing?null:'61 °C',fill:missing?null:Math.min(100,Math.round(61/cpuTempMax*100)),fillLabel:`CPU temperature: 61 of ${cpuTempMax} degrees Celsius`},
+      {id:'ram',label:'RAM',value:'11.2 GiB',fill:35},
+      {id:'swap',label:'Swap',value:'1.4 GiB',fill:18},
+      {id:'gpu',label:'GPU',value:missing?null:'72%',fill:missing?null:72},
+      {id:'gpu-temperature',label:'GPU temp',value:missing?null:'67 °C',fill:missing?null:Math.min(100,Math.round(67/gpuTempTarget*100)),fillLabel:`GPU temperature: 67 of ${gpuTempTarget} degrees Celsius`},
+      {id:'vram',label:'VRAM',value:missing?null:'2.1 GiB',fill:missing?null:35},
+      {id:'storage',label:'Storage',value:'312 GiB',fill:69,fillLabel:'Storage: 312 GiB remaining, 69% used'},
+      {id:'network-down',label:'Network down',value:'8.6 MiB/s'},
+      {id:'network-up',label:'Network up',value:'1.2 MiB/s'},
+      {id:'storage-read',label:'Storage read',value:'92 MiB/s'},
+      {id:'storage-write',label:'Storage write',value:'24 MiB/s'}
+    ];}
+    function fill(value,label){return `<div class="fill" role="img" aria-label="${escapeHtml(label)}"><span style="width:${value}%"></span></div>`;}
+    function glyph(id){const shapes={
+      cpu:'<rect x="5" y="5" width="14" height="14" rx="2"/><path d="M9 1v4m6-4v4M9 19v4m6-4v4M1 9h4m-4 6h4m14-6h4m-4 6h4"/><rect x="9" y="9" width="6" height="6" rx="1"/>',
+      temperature:'<path d="M9 14V5a3 3 0 0 1 6 0v9a5 5 0 1 1-6 0Z"/><path d="M12 10v7"/><circle cx="12" cy="18" r="1"/>',
+      ram:'<rect x="2" y="6" width="20" height="11" rx="1"/><path d="M6 17v3m4-3v3m4-3v3m4-3v3"/><rect x="5" y="9" width="4" height="5"/><rect x="11" y="9" width="4" height="5"/><path d="M18 10v4"/>',
+      swap:'<path d="M4 8h15l-3-3m3 3-3 3M20 16H5l3-3m-3 3 3 3"/>',
+      gpu:'<rect x="2" y="6" width="19" height="12" rx="1"/><circle cx="10" cy="12" r="4"/><circle cx="10" cy="12" r="1"/><path d="M21 9h2m-2 6h2M16 10h2m-2 4h2"/>',
+      'gpu-temperature':'<path d="M9 14V5a3 3 0 0 1 6 0v9a5 5 0 1 1-6 0Z"/><path d="M12 10v7"/><circle cx="12" cy="18" r="1"/>',
+      vram:'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 1v3m5-3v3m5-3v3M7 20v3m5-3v3m5-3v3"/><rect x="7" y="8" width="10" height="8" rx="1"/>',
+      storage:'<ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v13c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 11c0 1.7 3.6 3 8 3s8-1.3 8-3"/>',
+      'network-down':'<path d="M12 2v16m-6-6 6 6 6-6"/><path d="M4 21h16"/>',
+      'network-up':'<path d="M12 20V4m-6 6 6-6 6 6"/><path d="M4 21h16"/>',
+      'storage-read':'<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="12" r="3"/><path d="M14 12h6m-3-3 3 3-3 3"/>',
+      'storage-write':'<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="12" r="3"/><path d="M20 12h-6m3-3-3 3 3 3"/>'
+    };return `<svg class="glyph" viewBox="0 0 24 24" aria-hidden="true">${shapes[id]}</svg>`;}
+    function row(metric){return `<div class="status-row"><div class="status-main"><span class="status-label">${glyph(metric.id)}${metric.label}</span><span class="status-value${metric.value?'':' na'}">${metric.value||'Unavailable'}</span></div>${metric.fill!=null?`<div class="status-side">${fill(metric.fill,metric.fillLabel||`${metric.label}: ${metric.fill}% used`)}</div>`:''}</div>`;}
+    function render(){
+      for(const key of Object.keys(choices))controls(key);
+      const dark=state.theme==='dark'||(state.theme==='system'&&matchMedia('(prefers-color-scheme: dark)').matches);
+      document.documentElement.dataset.theme=dark?'dark':'light';
+      document.getElementById('app-shell').classList.toggle('minimum',state.width==='minimum');
+      document.getElementById('app-body').innerHTML=`<div class="status-grid">${fixture().map(row).join('')}</div>`;
+    }
+    document.addEventListener('click',event=>{const button=event.target.closest('button');if(button?.dataset.key)setChoice(button.dataset.key,button.dataset.value);});
+    matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>{if(state.theme==='system')render();});
+    render();
+  </script>
+</body>
+</html>

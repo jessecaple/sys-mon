@@ -1,0 +1,5 @@
+interface:
+  display_name: "Session Audit"
+  short_description: "Audit past sessions and propose instruction edits"
+policy:
+  allow_implicit_invocation: false

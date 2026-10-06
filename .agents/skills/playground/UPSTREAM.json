@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/anthropics/claude-plugins-official",
+  "revision": "85cce0381e7860082641b59d961a2b8c368b8b79",
+  "path": "plugins/playground/skills/playground",
+  "licenseSource": "plugins/playground/LICENSE",
+  "modifiedFiles": [
+    "SKILL.md"
+  ],
+  "adaptation": "Provider-neutral chat wording, local HTML delivery and authorized browser verification; all six templates retained."
+}

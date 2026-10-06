@@ -1,0 +1,11 @@
+{
+  "repository": "https://github.com/ayghri/i-have-adhd",
+  "revision": "b15d0be58f55b33972ba3e39709e0e5208ef30cb",
+  "path": "skills/i-have-adhd",
+  "modified": false,
+  "installedFiles": [
+    "SKILL.md",
+    "LICENSE"
+  ],
+  "excluded": "agents/gemini.toml and agents/openai.yaml; harness-specific metadata the bundle does not use."
+}

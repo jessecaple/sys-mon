@@ -1,0 +1,12 @@
+{
+  "repository": "https://github.com/blader/humanizer",
+  "revision": "225a6f39ac85f76ee48dbad772ea4abe4ed6c9d8",
+  "path": "SKILL.md",
+  "license": "MIT",
+  "modified": false,
+  "installedFiles": [
+    "SKILL.md",
+    "LICENSE"
+  ],
+  "excluded": "Plugin manifests, agent metadata, issue templates, validation script and changelog. No role preloads the skill: the Software Engineer loads it only when its change adds or rewrites text people read in the product or its docs."
+}
