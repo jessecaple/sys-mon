@@ -1,10 +1,18 @@
 use std::time::Duration;
-use sys_mon::telemetry::{TelemetrySession, run_temperature_helper};
+use sys_mon::telemetry::{TelemetrySession, run_gpu_helper, run_temperature_helper};
 
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("--internal-temperature-probe") {
         if let Err(error) = run_temperature_helper() {
             eprintln!("temperature probe failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if std::env::args().nth(1).as_deref() == Some("--internal-gpu-probe") {
+        if let Err(error) = run_gpu_helper() {
+            eprintln!("gpu probe failed: {error}");
             std::process::exit(1);
         }
         return;
