@@ -226,28 +226,33 @@ fn build_window(app: &adw::Application, fixture: Option<&Snapshot>) {
             return glib::Propagation::Stop;
         }
         window.set_visible(false);
-        if let Some(mut session) = session_for_close.borrow_mut().take() {
-            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
-            std::thread::spawn(move || {
-                session.stop();
-                let _ = done_tx.send(());
-            });
-            let app = app_for_close.clone();
-            glib::timeout_add_local(Duration::from_millis(40), move || {
-                match done_rx.try_recv() {
-                    Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        app.quit();
-                        glib::ControlFlow::Break
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        let done_rx = stop_in_background(session_for_close.borrow_mut().take());
+        let app = app_for_close.clone();
+        glib::timeout_add_local(Duration::from_millis(40), move || {
+            match done_rx.try_recv() {
+                Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    app.quit();
+                    glib::ControlFlow::Break
                 }
-            });
-        } else {
-            app_for_close.quit();
-        }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            }
+        });
         glib::Propagation::Stop
     });
     window.present();
+}
+
+fn stop_in_background(session: Option<TelemetrySession>) -> std::sync::mpsc::Receiver<()> {
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+    if let Some(mut session) = session {
+        std::thread::spawn(move || {
+            session.stop();
+            let _ = done_tx.send(());
+        });
+    } else {
+        let _ = done_tx.send(());
+    }
+    done_rx
 }
 
 fn startup_failed_snapshot() -> Snapshot {
@@ -332,6 +337,27 @@ pub fn run_fixture(case: &str) -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::{Patch, Provider, ProviderKind, StopToken};
+
+    struct HeldProvider {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Provider for HeldProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Temperature
+        }
+
+        fn sample(&mut self, _elapsed: Duration, stop: &StopToken) -> Patch {
+            self.entered.send(()).unwrap();
+            self.release.recv().unwrap();
+            while !stop.is_stopped() {
+                std::thread::yield_now();
+            }
+            Patch::Temperature(Reading::Unavailable(UnavailableReason::Missing))
+        }
+    }
 
     #[test]
     fn startup_failure_has_no_permanent_waiting_cells() {
@@ -342,5 +368,35 @@ mod tests {
                 assert!(line.rail.is_none());
             }
         }
+    }
+
+    #[test]
+    fn close_stop_returns_to_main_loop_during_in_flight_sample() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let mut builder = TelemetrySession::builder();
+        builder
+            .register(HeldProvider {
+                entered: entered_tx,
+                release: release_rx,
+            })
+            .unwrap();
+        let session = builder.start().unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let done = stop_in_background(Some(session));
+        assert!(matches!(
+            done.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        release_tx.send(()).unwrap();
+        done.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn close_after_startup_failure_has_no_worker_to_wait_for() {
+        stop_in_background(None)
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap();
     }
 }
