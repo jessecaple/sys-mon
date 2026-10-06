@@ -187,6 +187,85 @@ fn wait_until(mut condition: impl FnMut() -> bool) {
     }
 }
 
+struct SourceDrivenHost {
+    sample_number: u64,
+}
+
+impl HostProbe for SourceDrivenHost {
+    fn read_stat(&mut self) -> io::Result<String> {
+        self.sample_number += 1;
+        Ok(stat(
+            100 + self.sample_number * 10,
+            100 + self.sample_number * 10,
+            0,
+            5,
+        ))
+    }
+    fn read_meminfo(&mut self) -> io::Result<String> {
+        Ok(mem(100, 40, 10, 5))
+    }
+}
+
+struct FastHostSampler(HostSampler<SourceDrivenHost>);
+
+impl Provider for FastHostSampler {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Host
+    }
+    fn sample(&mut self, elapsed: Duration, _stop: &StopToken) -> Patch {
+        Patch::Host(self.0.tick(elapsed))
+    }
+    fn interval(&self) -> Duration {
+        Duration::from_millis(10)
+    }
+}
+
+#[test]
+fn controlled_proc_sources_flow_through_public_session_snapshot() {
+    let mut builder = SessionBuilder::new();
+    builder
+        .register(FastHostSampler(HostSampler::new(SourceDrivenHost {
+            sample_number: 0,
+        })))
+        .unwrap();
+    let mut session = builder.start().unwrap();
+    wait_until(|| session.snapshot().cpu.usage_percent == Reading::Value(50.0));
+    let snapshot = session.snapshot();
+    assert_eq!(
+        snapshot.ram,
+        Reading::Value(MemoryAmount {
+            used_bytes: 60 * 1024,
+            total_bytes: 100 * 1024
+        })
+    );
+    assert_eq!(
+        snapshot.swap,
+        Reading::Value(MemoryAmount {
+            used_bytes: 5 * 1024,
+            total_bytes: 10 * 1024
+        })
+    );
+    session.stop();
+}
+
+#[test]
+fn zero_or_tiny_provider_interval_is_rejected_before_spawning() {
+    for interval in [Duration::ZERO, Duration::from_millis(1)] {
+        let provider = RepeatingProvider {
+            kind: ProviderKind::Host,
+            patch: Patch::Host(HostPatch {
+                cpu_usage_percent: Reading::Value(1.0),
+                ram: Reading::Unavailable(UnavailableReason::Missing),
+                swap: Reading::Unavailable(UnavailableReason::Missing),
+            }),
+            ticks: Arc::new(AtomicUsize::new(0)),
+            interval,
+            work: Duration::ZERO,
+        };
+        assert!(SessionBuilder::new().register(provider).is_err());
+    }
+}
+
 #[test]
 fn provider_interleaving_preserves_disjoint_fields_and_stop_ends_all_workers() {
     let ticks = Arc::new(AtomicUsize::new(0));
@@ -204,7 +283,7 @@ fn provider_interleaving_preserves_disjoint_fields_and_stop_ends_all_workers() {
             }),
         }),
         ticks: Arc::clone(&ticks),
-        interval: Duration::from_millis(3),
+        interval: Duration::from_millis(10),
         work: Duration::ZERO,
     };
     let gpu = RepeatingProvider {
@@ -218,7 +297,7 @@ fn provider_interleaving_preserves_disjoint_fields_and_stop_ends_all_workers() {
             temperature: Reading::Unavailable(UnavailableReason::Missing),
         }),
         ticks: Arc::new(AtomicUsize::new(0)),
-        interval: Duration::from_millis(7),
+        interval: Duration::from_millis(15),
         work: Duration::ZERO,
     };
     let io = RepeatingProvider {
@@ -239,7 +318,7 @@ fn provider_interleaving_preserves_disjoint_fields_and_stop_ends_all_workers() {
             },
         }),
         ticks: Arc::new(AtomicUsize::new(0)),
-        interval: Duration::from_millis(7),
+        interval: Duration::from_millis(15),
         work: Duration::ZERO,
     };
     let mut builder = SessionBuilder::new();
@@ -284,7 +363,7 @@ fn slow_provider_never_overlaps_or_builds_a_catch_up_queue() {
             swap: Reading::Unavailable(UnavailableReason::Missing),
         }),
         ticks: Arc::clone(&ticks),
-        interval: Duration::from_millis(5),
+        interval: Duration::from_millis(10),
         work: Duration::from_millis(25),
     };
     let mut builder = SessionBuilder::new();
@@ -325,7 +404,7 @@ fn unreleased_temperature_helper_does_not_stall_host_or_shutdown() {
             swap: Reading::Unavailable(UnavailableReason::Missing),
         }),
         ticks: Arc::clone(&ticks),
-        interval: Duration::from_millis(5),
+        interval: Duration::from_millis(10),
         work: Duration::ZERO,
     };
     let mut builder = SessionBuilder::new();

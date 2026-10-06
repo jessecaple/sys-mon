@@ -287,6 +287,12 @@ impl SessionBuilder {
     }
 
     pub fn register<P: Provider>(&mut self, provider: P) -> io::Result<&mut Self> {
+        if provider.interval() < Duration::from_millis(10) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "provider interval must be at least 10 ms",
+            ));
+        }
         if self
             .providers
             .iter()
