@@ -4,7 +4,7 @@ Wayfinder map: `wf-48ebf7`. Approved behavior: [specification](wf-48ebf7-spec.md
 
 Integration is Git branch `main` at `~/code/sys-mon`. Its execution baseline is `01c6ec320115135e1944af0bd76d897ad69fa13a`. Each ticket uses a branch and worktree from current integration and lands only through `wayfinder land`. Do not edit integration directly for ticket work.
 
-The current code is a Rust 2024 Cargo package with no GTK application or test harness yet. Use Rust's standard test harness for telemetry. Run `cargo fmt --check`, `cargo test`, and `cargo clippy --all-targets -- -D warnings` where applicable. Native UI checks belong to the dashboard ticket. The available host is Fedora 44 x86_64 with an Intel Core i9-13900K, an NVIDIA RTX 4090, `coretemp` package readings, and Btrfs `/` and `/home` subvolumes. Hardware availability is an observation, not a claim of cross-machine coverage.
+The code is a Rust 2024 Cargo package. Use Rust's standard test harness for telemetry and presentation. Run `cargo fmt --check`, `cargo test`, and `cargo clippy --all-targets -- -D warnings`. Native build requirements are in [build.md](build.md). The available host is Fedora 44 x86_64 with an Intel Core i9-13900K, an NVIDIA RTX 4090, `coretemp` package readings, and Btrfs `/` and `/home` subvolumes. Hardware availability is an observation, not a claim of cross-machine coverage.
 
 Durable ticket evidence and reviewer handoffs live under `~/.wayfinder/evidence/wf-48ebf7/`. Ticket preparation and technical contracts are committed in `docs/verification/` or owning code documentation. Qualify evidence against exact candidate and integration SHA, source fixtures and runtime inputs. Record physical-hardware versus fixture-only checks separately.
 
