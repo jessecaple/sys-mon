@@ -6,6 +6,7 @@
 //! calls belong in killable helpers, as the temperature provider demonstrates.
 
 mod gpu;
+mod io_provider;
 mod linux;
 
 use std::io;
@@ -15,6 +16,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 pub use gpu::{GpuProvider, run_gpu_helper};
+use io_provider::IoSampler;
 pub use linux::{
     HostProbe, HostSampler, LinuxHostProbe, TemperatureProvider, run_temperature_helper,
 };
@@ -84,6 +86,7 @@ pub struct NetworkSnapshot {
 pub struct PrimaryVolume {
     pub paths: Vec<String>,
     pub available_bytes: u64,
+    pub used_bytes: u64,
     pub total_bytes: u64,
 }
 
@@ -430,6 +433,7 @@ impl TelemetrySession {
         builder.register(HostSampler::new(LinuxHostProbe))?;
         builder.register(TemperatureProvider::system()?)?;
         builder.register(GpuProvider::system()?)?;
+        builder.register(IoSampler::system())?;
         builder.start()
     }
 
