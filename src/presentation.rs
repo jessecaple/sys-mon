@@ -56,14 +56,16 @@ fn value_line(value: String, description: String, rail: Option<f64>) -> DisplayL
 fn percent(label: &str, reading: &Reading<f64>) -> DisplayLine {
     match reading {
         Reading::Value(n) if n.is_finite() && *n >= 0.0 => {
-            let visible = if *n > 0.0 && *n < 0.5 {
-                "<1%".to_string()
+            let visible = if *n > 0.0 && *n < 0.1 {
+                "<0.1%".to_string()
+            } else if *n > 0.0 && *n < 1.0 {
+                format!("{n:.1}%")
             } else {
                 format!("{n:.0}%")
             };
             value_line(
                 visible,
-                format!("{label}: {n:.1} percent"),
+                format!("{label}: {n} percent"),
                 Some((n / 100.0).clamp(0.0, 1.0)),
             )
         }
@@ -180,7 +182,10 @@ fn volume_line(volume: &PrimaryVolume, include_path: bool) -> DisplayLine {
             bytes(volume.total_bytes)
         )
     } else {
-        format!("Storage {paths}: {available} remaining; used capacity unknown")
+        format!(
+            "Storage {paths}: {available} remaining; {} used; total capacity unknown",
+            bytes(volume.used_bytes)
+        )
     };
     value_line(value, description, rail)
 }
@@ -389,6 +394,11 @@ mod tests {
         let partial = &present(&snapshot)[7].lines[0];
         assert_eq!(partial.value, "/home 0 B");
         assert!(partial.description.contains("remaining"));
+        assert!(
+            partial
+                .description
+                .contains("10 B used; total capacity unknown")
+        );
         assert!(partial.rail.is_none());
     }
 
@@ -424,11 +434,13 @@ mod tests {
     #[test]
     fn small_nonzero_activity_does_not_look_like_zero() {
         let mut snapshot = Snapshot::default();
-        snapshot.cpu.usage_percent = Reading::Value(0.2);
+        snapshot.cpu.usage_percent = Reading::Value(0.04);
         snapshot.network.down_bytes_per_second = Reading::Value(0.2);
         let cells = present(&snapshot);
-        assert_eq!(cells[0].lines[0].value, "<1%");
-        assert!(cells[0].lines[0].description.contains("0.2 percent"));
+        assert_eq!(cells[0].lines[0].value, "<0.1%");
+        assert!(cells[0].lines[0].description.contains("0.04 percent"));
         assert_eq!(cells[8].lines[0].value, "<1 B/s");
+        snapshot.cpu.usage_percent = Reading::Value(0.5);
+        assert_eq!(present(&snapshot)[0].lines[0].value, "0.5%");
     }
 }
