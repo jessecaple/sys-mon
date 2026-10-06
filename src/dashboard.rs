@@ -58,7 +58,7 @@ impl CellWidget {
     fn new(index: usize) -> Self {
         let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
         body.add_css_class("metric-cell");
-        if index % 2 == 0 {
+        if index.is_multiple_of(2) {
             body.add_css_class("metric-left");
         }
         if index < 2 {
@@ -180,7 +180,7 @@ fn build_window(app: &adw::Application, fixture: Option<&Snapshot>) {
     install_style();
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("SysMon")
+        .title("sys-mon")
         .default_width(520)
         .default_height(290)
         .build();
@@ -190,7 +190,7 @@ fn build_window(app: &adw::Application, fixture: Option<&Snapshot>) {
     let header_handle = gtk::WindowHandle::new();
     let header = gtk::CenterBox::new();
     header.add_css_class("compact-titlebar");
-    let title = gtk::Label::new(Some("SysMon"));
+    let title = gtk::Label::new(Some("sys-mon"));
     title.add_css_class("title");
     header.set_center_widget(Some(&title));
     header.set_start_widget(Some(&gtk::WindowControls::new(gtk::PackType::Start)));
