@@ -19,6 +19,7 @@ type EngineActivity = unsafe extern "C" fn(Handle, *mut EngineStats) -> ResultCo
 type TempState = unsafe extern "C" fn(Handle, *mut f64) -> ResultCode;
 
 const SUCCESS: ResultCode = 0;
+const INIT_GPU_ONLY: u32 = 1;
 const ENGINE_PROPERTIES: u32 = 0x5;
 const MEM_PROPERTIES: u32 = 0xb;
 const TEMP_PROPERTIES: u32 = 0x14;
@@ -178,8 +179,12 @@ pub(super) fn scan_intel() -> Vec<DeviceFrame> {
     let Some(api) = Api::load() else {
         return Vec::new();
     };
+    scan_with_api(api)
+}
+
+fn scan_with_api(api: Api) -> Vec<DeviceFrame> {
     // SAFETY: Api owns a loaded Sysman library and the flag is defined by its ABI.
-    if unsafe { (api.init)(0) } != SUCCESS {
+    if unsafe { (api.init)(INIT_GPU_ONLY) } != SUCCESS {
         return Vec::new();
     }
     let Some(drivers) = enumerate(|count, handles| {
@@ -321,6 +326,9 @@ fn device_memory(api: &Api, device: Handle) -> Reading<MemoryAmount> {
             continue;
         }
         found = true;
+        if properties.physical_size == 0 {
+            return Reading::Unavailable(UnavailableReason::Missing);
+        }
         let mut state = MemState {
             stype: MEM_STATE,
             ..Default::default()
@@ -430,19 +438,42 @@ fn degrees_to_milli(value: f64) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    unsafe extern "C" fn no_init(_flags: u32) -> ResultCode {
+    static INIT_FLAGS: AtomicUsize = AtomicUsize::new(0);
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    unsafe extern "C" fn no_init(flags: u32) -> ResultCode {
+        INIT_FLAGS.store(flags as usize, Ordering::SeqCst);
         SUCCESS
     }
-    unsafe extern "C" fn no_drivers(_count: *mut u32, _handles: *mut Handle) -> ResultCode {
+    unsafe extern "C" fn no_drivers(count: *mut u32, handles: *mut Handle) -> ResultCode {
+        // SAFETY: scan_with_api supplies the ABI's count and one-handle buffer.
+        unsafe {
+            *count = 1;
+            if !handles.is_null() {
+                *handles = 3 as Handle;
+            }
+        }
         SUCCESS
     }
     unsafe extern "C" fn no_devices(
         _device: Handle,
-        _count: *mut u32,
-        _handles: *mut Handle,
+        count: *mut u32,
+        handles: *mut Handle,
     ) -> ResultCode {
+        // The mock Sysman driver exposes a GPU and a VPU; GPU_ONLY filters VPU.
+        let gpu_only = INIT_FLAGS.load(Ordering::SeqCst) == INIT_GPU_ONLY as usize;
+        // SAFETY: scan_with_api supplies the ABI's count and two-handle buffer.
+        unsafe {
+            *count = if gpu_only { 1 } else { 2 };
+            if !handles.is_null() {
+                *handles = 1 as Handle;
+                if !gpu_only {
+                    *handles.add(1) = 9 as Handle;
+                }
+            }
+        }
         SUCCESS
     }
     unsafe extern "C" fn both(
@@ -478,6 +509,22 @@ mod tests {
         }
         SUCCESS
     }
+    unsafe extern "C" fn known_and_unknown_roots(
+        _device: Handle,
+        count: *mut u32,
+        handles: *mut Handle,
+    ) -> ResultCode {
+        // SAFETY: the test caller supplies the ABI's count and three-handle buffer.
+        unsafe {
+            *count = 3;
+            if !handles.is_null() {
+                *handles = 1 as Handle;
+                *handles.add(1) = 2 as Handle;
+                *handles.add(2) = 3 as Handle;
+            }
+        }
+        SUCCESS
+    }
     unsafe extern "C" fn memory_properties(
         handle: Handle,
         output: *mut MemProperties,
@@ -486,14 +533,20 @@ mod tests {
         unsafe {
             (*output).location = MEM_LOC_DEVICE;
             (*output).on_subdevice = (handle as usize == 2) as u32;
-            (*output).physical_size = 100;
+            (*output).physical_size = if handle as usize == 3 { 0 } else { 100 };
         }
         SUCCESS
     }
     unsafe extern "C" fn memory_state(handle: Handle, output: *mut MemState) -> ResultCode {
         // SAFETY: device_memory passes a live initialized output buffer.
         unsafe {
-            (*output).free = if handle as usize == 1 { 40 } else { 20 };
+            (*output).free = if handle as usize == 1 {
+                40
+            } else if handle as usize == 2 {
+                20
+            } else {
+                0
+            };
         }
         SUCCESS
     }
@@ -568,6 +621,8 @@ mod tests {
 
     #[test]
     fn sysman_adapter_ignores_subdevice_overlap_and_refuses_subdevice_only() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        ACTIVITY_CALLS.store(0, Ordering::SeqCst);
         let mut api = fake_api();
         assert_eq!(
             device_memory(&api, 1 as Handle),
@@ -603,6 +658,22 @@ mod tests {
             gpu_temperature(&api, 1 as Handle),
             Reading::Unavailable(UnavailableReason::Missing)
         );
+        api.memories = Some(known_and_unknown_roots);
+        assert_eq!(
+            device_memory(&api, 1 as Handle),
+            Reading::Unavailable(UnavailableReason::Missing)
+        );
+    }
+
+    #[test]
+    fn sysman_initialization_filters_vpu_before_gpu_selection() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        ACTIVITY_CALLS.store(0, Ordering::SeqCst);
+        let frames = scan_with_api(fake_api());
+        assert_eq!(INIT_FLAGS.load(Ordering::SeqCst), INIT_GPU_ONLY as usize);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].vendor, Vendor::Intel);
+        assert_eq!(frames[0].patch.usage_percent, Reading::Value(50.0));
     }
 
     #[test]

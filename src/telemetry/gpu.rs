@@ -494,12 +494,8 @@ fn scan_amd_temperature(device: &Path) -> Reading<Temperature> {
                 _ => continue,
             };
             let prefix = format!("temp{index}");
-            if fs::read_to_string(chip.join(format!("{prefix}_fault")))
-                .ok()
-                .is_some_and(|value| value.trim() != "0")
-                || fs::read_to_string(chip.join(format!("{prefix}_enable")))
-                    .ok()
-                    .is_some_and(|value| value.trim() != "1")
+            if !status_allows(chip.join(format!("{prefix}_fault")), "0")
+                || !status_allows(chip.join(format!("{prefix}_enable")), "1")
             {
                 continue;
             }
@@ -551,6 +547,14 @@ fn read_positive_i64(path: PathBuf) -> Option<i64> {
         .parse::<i64>()
         .ok()
         .filter(|value| *value > 0)
+}
+
+fn status_allows(path: PathBuf, expected: &str) -> bool {
+    match fs::read_to_string(path) {
+        Ok(value) => value.trim() == expected,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -637,6 +641,28 @@ mod tests {
                 ..
             })
         ));
+        fs::remove_file(hwmon.join("temp1_fault")).unwrap();
+        fs::create_dir(hwmon.join("temp1_fault")).unwrap();
+        let frame = scan_amd(&root, |_| AmdMemoryKind::Discrete).pop().unwrap();
+        assert!(matches!(
+            frame.patch.temperature,
+            Reading::Value(Temperature {
+                millidegrees_celsius: 61_000,
+                ..
+            })
+        ));
+        fs::remove_dir(hwmon.join("temp1_fault")).unwrap();
+        fs::create_dir(hwmon.join("temp1_enable")).unwrap();
+        let frame = scan_amd(&root, |_| AmdMemoryKind::Discrete).pop().unwrap();
+        assert!(matches!(
+            frame.patch.temperature,
+            Reading::Value(Temperature {
+                millidegrees_celsius: 61_000,
+                ..
+            })
+        ));
+        fs::remove_dir(hwmon.join("temp1_enable")).unwrap();
+        fs::write(hwmon.join("temp1_fault"), "1\n").unwrap();
         fs::write(hwmon.join("temp3_label"), "junction\n").unwrap();
         fs::write(hwmon.join("temp3_input"), "62000\n").unwrap();
         let frame = scan_amd(&root, |_| AmdMemoryKind::Discrete).pop().unwrap();
