@@ -1078,6 +1078,55 @@ mod tests {
     }
 
     #[test]
+    fn thousands_of_device_replacements_and_failures_do_not_retain_old_baselines() {
+        struct ChangingDevices {
+            sample: u64,
+        }
+
+        impl IoProbe for ChangingDevices {
+            fn network(&mut self) -> io::Result<NetworkFrame> {
+                Ok(network_frame("eno2", (self.sample, self.sample), (0, 0)))
+            }
+
+            fn block(&mut self) -> io::Result<Vec<BlockDevice>> {
+                let sample = self.sample;
+                self.sample += 1;
+                if sample % 1000 == 999 {
+                    return Err(io::ErrorKind::PermissionDenied.into());
+                }
+                Ok(vec![block_device(
+                    "disk",
+                    &format!("8:{}", sample / 2),
+                    None,
+                    false,
+                    sample * 100,
+                    sample * 200,
+                )])
+            }
+
+            fn volumes(&mut self) -> io::Result<VolumeFrame> {
+                Ok(mounts(43, 63, "/dev/nvme0n1p3", "0:35"))
+            }
+        }
+
+        let mut sampler = IoSampler::new(ChangingDevices { sample: 0 });
+        for sample in 0..10_000 {
+            let patch = sampler.tick(Duration::from_secs(sample));
+            let expected = if sample % 1000 == 999 {
+                Reading::Unavailable(UnavailableReason::PermissionDenied)
+            } else if sample % 2 == 0 {
+                Reading::Unavailable(UnavailableReason::WarmingUp)
+            } else {
+                Reading::Value(100.0)
+            };
+            assert_eq!(patch.storage.read_bytes_per_second, expected);
+            assert!(sampler.block_previous.len() <= 1);
+            assert!(matches!(patch.storage.primary_volumes, Reading::Value(_)));
+        }
+        assert!(sampler.block_previous.is_empty());
+    }
+
+    #[test]
     fn source_failure_clears_only_its_baseline_and_invalid_time_never_spikes() {
         let mut source = frames(
             vec![
