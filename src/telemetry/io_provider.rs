@@ -65,13 +65,13 @@ struct FsNumbers {
 
 struct OpenVolume {
     mount_id: u64,
-    numbers: FsNumbers,
+    numbers: Option<FsNumbers>,
 }
 
 struct VolumeFrame {
     mountinfo: String,
-    root: OpenVolume,
-    home: OpenVolume,
+    root: Result<OpenVolume, UnavailableReason>,
+    home: Result<OpenVolume, UnavailableReason>,
 }
 
 trait IoProbe: Send + 'static {
@@ -173,10 +173,11 @@ impl IoProbe for LinuxIoProbe {
     }
 
     fn volumes(&mut self) -> io::Result<VolumeFrame> {
-        let root = open_volume("/")?;
-        let home = open_volume("/home")?;
+        let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+        let root = open_volume("/", &mountinfo).map_err(|error| reason_for_io(&error));
+        let home = open_volume("/home", &mountinfo).map_err(|error| reason_for_io(&error));
         Ok(VolumeFrame {
-            mountinfo: fs::read_to_string("/proc/self/mountinfo")?,
+            mountinfo,
             root,
             home,
         })
@@ -194,7 +195,7 @@ fn invalid_input(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn open_volume(path: &str) -> io::Result<OpenVolume> {
+fn open_volume(path: &str, mountinfo: &str) -> io::Result<OpenVolume> {
     let path = CString::new(path).map_err(|_| invalid_input("invalid volume path"))?;
     // O_PATH needs search permission on ancestors, but not read permission on
     // the mounted directory itself. Keep one descriptor for identity and size.
@@ -216,19 +217,25 @@ fn open_volume(path: &str) -> io::Result<OpenVolume> {
                 .and_then(|value| value.trim().parse().ok())
         })
         .ok_or_else(|| invalid_input("missing mount ID"))?;
-    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstatvfs(file.as_raw_fd(), &mut stat) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(OpenVolume {
-        mount_id,
-        numbers: FsNumbers {
+    let identity = mount_identity(mountinfo, mount_id)
+        .ok_or_else(|| invalid_input("missing effective mount identity"))?;
+    // Network and unclassified filesystems may block inside fstatvfs. Only
+    // ask eligible local storage for its capacity.
+    let numbers = if mount_class(&identity.fs_type) == MountClass::Storage {
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatvfs(file.as_raw_fd(), &mut stat) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Some(FsNumbers {
             blocks: stat.f_blocks,
             free: stat.f_bfree,
             available: stat.f_bavail,
             fragment_size: stat.f_frsize,
-        },
-    })
+        })
+    } else {
+        None
+    };
+    Ok(OpenVolume { mount_id, numbers })
 }
 
 fn reason_for_io(error: &io::Error) -> UnavailableReason {
@@ -404,6 +411,27 @@ struct MountIdentity {
     source: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MountClass {
+    Storage,
+    Excluded,
+    Unknown,
+}
+
+fn mount_class(fs_type: &str) -> MountClass {
+    match fs_type {
+        "ext2" | "ext3" | "ext4" | "btrfs" | "xfs" | "f2fs" | "zfs" | "bcachefs" | "vfat"
+        | "exfat" | "ntfs" | "ntfs3" | "erofs" | "squashfs" | "iso9660" | "udf" => {
+            MountClass::Storage
+        }
+        "nfs" | "nfs4" | "cifs" | "smb3" | "9p" | "ceph" | "glusterfs" | "afs" | "coda"
+        | "orangefs" | "lustre" | "fuse.sshfs" | "fuse.rclone" | "fuse.davfs"
+        | "fuse.glusterfs" | "fuse.ceph" | "tmpfs" | "ramfs" | "devtmpfs" | "hugetlbfs"
+        | "proc" | "sysfs" => MountClass::Excluded,
+        _ => MountClass::Unknown,
+    }
+}
+
 fn mount_identity(text: &str, id: u64) -> Option<MountIdentity> {
     text.lines().find_map(|line| {
         let (left, right) = line.split_once(" - ")?;
@@ -438,39 +466,60 @@ fn volume_numbers(numbers: &FsNumbers) -> Option<(u64, u64, u64)> {
     ))
 }
 
-fn primary_volumes(frame: VolumeFrame) -> Reading<Vec<PrimaryVolume>> {
-    let Some(root_id) = mount_identity(&frame.mountinfo, frame.root.mount_id) else {
-        return Reading::Unavailable(UnavailableReason::InvalidData);
-    };
-    let Some(home_id) = mount_identity(&frame.mountinfo, frame.home.mount_id) else {
-        return Reading::Unavailable(UnavailableReason::InvalidData);
-    };
-    let Some((root_available, root_used, root_total)) = volume_numbers(&frame.root.numbers) else {
-        return Reading::Unavailable(UnavailableReason::InvalidData);
-    };
-    let Some((home_available, home_used, home_total)) = volume_numbers(&frame.home.numbers) else {
-        return Reading::Unavailable(UnavailableReason::InvalidData);
-    };
-    let shared = root_id.device == home_id.device
-        && root_id.fs_type == home_id.fs_type
-        && root_id.source == home_id.source;
-    let mut volumes = vec![PrimaryVolume {
-        paths: vec!["/".to_owned()],
-        available_bytes: root_available,
-        used_bytes: root_used,
-        total_bytes: root_total,
-    }];
-    if shared {
-        volumes[0].paths.push("/home".to_owned());
-    } else {
-        volumes.push(PrimaryVolume {
-            paths: vec!["/home".to_owned()],
-            available_bytes: home_available,
-            used_bytes: home_used,
-            total_bytes: home_total,
-        });
+fn selected_volume(
+    mountinfo: &str,
+    path: &str,
+    opened: Result<OpenVolume, UnavailableReason>,
+) -> Result<Option<(MountIdentity, PrimaryVolume)>, UnavailableReason> {
+    let opened = opened?;
+    let identity =
+        mount_identity(mountinfo, opened.mount_id).ok_or(UnavailableReason::InvalidData)?;
+    match mount_class(&identity.fs_type) {
+        MountClass::Excluded => return Ok(None),
+        MountClass::Unknown => return Err(UnavailableReason::InvalidData),
+        MountClass::Storage => {}
     }
-    Reading::Value(volumes)
+    let numbers = opened.numbers.ok_or(UnavailableReason::InvalidData)?;
+    let (available_bytes, used_bytes, total_bytes) =
+        volume_numbers(&numbers).ok_or(UnavailableReason::InvalidData)?;
+    Ok(Some((
+        identity,
+        PrimaryVolume {
+            paths: vec![path.to_owned()],
+            available_bytes,
+            used_bytes,
+            total_bytes,
+        },
+    )))
+}
+
+fn primary_volumes(frame: VolumeFrame) -> Reading<Vec<PrimaryVolume>> {
+    let mut volumes: Vec<(MountIdentity, PrimaryVolume)> = Vec::new();
+    let mut first_failure = None;
+    for (path, opened) in [("/", frame.root), ("/home", frame.home)] {
+        match selected_volume(&frame.mountinfo, path, opened) {
+            Ok(Some((identity, volume))) => {
+                if let Some((_, prior)) = volumes.iter_mut().find(|(prior_id, _)| {
+                    prior_id.device == identity.device
+                        && prior_id.fs_type == identity.fs_type
+                        && prior_id.source == identity.source
+                }) {
+                    prior.paths.push(path.to_owned());
+                } else {
+                    volumes.push((identity, volume));
+                }
+            }
+            Ok(None) => {}
+            Err(reason) => {
+                first_failure.get_or_insert(reason);
+            }
+        }
+    }
+    if volumes.is_empty() {
+        Reading::Unavailable(first_failure.unwrap_or(UnavailableReason::Missing))
+    } else {
+        Reading::Value(volumes.into_iter().map(|(_, volume)| volume).collect())
+    }
 }
 
 fn rate(current: u64, prior: u64, elapsed: Duration, prior_at: Duration) -> Reading<f64> {
@@ -660,6 +709,7 @@ mod tests {
     use crate::telemetry::{SessionBuilder, Snapshot};
     use std::collections::VecDeque;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Instant;
@@ -731,25 +781,45 @@ mod tests {
             mountinfo: format!(
                 "43 1 0:35 /root / rw - btrfs /dev/nvme0n1p3 rw\n63 43 {home_dev} /home /home rw - btrfs {home_source} rw\n80 43 0:50 / /home2 rw - ext4 /dev/other rw\n"
             ),
-            root: OpenVolume {
+            root: Ok(OpenVolume {
                 mount_id: root_id,
-                numbers: FsNumbers {
+                numbers: Some(FsNumbers {
                     blocks: 100,
                     free: 30,
                     available: 20,
                     fragment_size: 4096,
-                },
-            },
-            home: OpenVolume {
+                }),
+            }),
+            home: Ok(OpenVolume {
                 mount_id: home_id,
-                numbers: FsNumbers {
+                numbers: Some(FsNumbers {
                     blocks: 100,
                     free: 30,
                     available: 20,
                     fragment_size: 4096,
-                },
-            },
+                }),
+            }),
         }
+    }
+
+    fn numbers_mut(opened: &mut Result<OpenVolume, UnavailableReason>) -> &mut FsNumbers {
+        opened.as_mut().unwrap().numbers.as_mut().unwrap()
+    }
+
+    fn mount_type(frame: &mut VolumeFrame, id: u64, fs_type: &str, source: &str) {
+        frame.mountinfo = frame
+            .mountinfo
+            .lines()
+            .map(|line| {
+                if line.starts_with(&format!("{id} ")) {
+                    let (left, _) = line.split_once(" - ").unwrap();
+                    format!("{left} - {fs_type} {source} rw")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
     }
 
     fn minimal_blocks(down: u64, up: u64) -> Vec<BlockDevice> {
@@ -1092,32 +1162,97 @@ mod tests {
         assert_eq!(distinct.len(), 2);
         assert_eq!(distinct[0].paths, ["/"]);
         assert_eq!(distinct[1].paths, ["/home"]);
+        let mut ext4_home = mounts(43, 63, "/dev/sdb1", "8:17");
+        mount_type(&mut ext4_home, 63, "ext4", "/dev/sdb1");
+        assert!(
+            matches!(primary_volumes(ext4_home), Reading::Value(ref volumes) if volumes.len() == 2 && volumes[1].paths == ["/home"])
+        );
         let mut absent = mounts(43, 99, "/dev/sdb1", "8:17");
-        assert_eq!(
-            primary_volumes(absent),
-            Reading::Unavailable(UnavailableReason::InvalidData)
+        assert!(
+            matches!(primary_volumes(absent), Reading::Value(ref volumes) if volumes.len() == 1 && volumes[0].paths == ["/"])
         );
         absent = mounts(43, 63, "/dev/nvme0n1p3", "0:35");
-        absent.home.numbers.available = 31;
-        assert_eq!(
-            primary_volumes(absent),
-            Reading::Unavailable(UnavailableReason::InvalidData)
+        numbers_mut(&mut absent.home).available = 31;
+        assert!(
+            matches!(primary_volumes(absent), Reading::Value(ref volumes) if volumes.len() == 1 && volumes[0].paths == ["/"])
         );
         let mut full = mounts(43, 63, "/dev/nvme0n1p3", "0:35");
-        full.root.numbers.free = 0;
-        full.root.numbers.available = 0;
-        full.home.numbers.free = 0;
-        full.home.numbers.available = 0;
+        numbers_mut(&mut full.root).free = 0;
+        numbers_mut(&mut full.root).available = 0;
+        numbers_mut(&mut full.home).free = 0;
+        numbers_mut(&mut full.home).available = 0;
         let Reading::Value(full) = primary_volumes(full) else {
             panic!("full volume");
         };
         assert_eq!(full[0].available_bytes, 0);
         assert_eq!(full[0].used_bytes, full[0].total_bytes);
         let mut overflow = mounts(43, 63, "/dev/nvme0n1p3", "0:35");
-        overflow.root.numbers.blocks = u64::MAX;
+        numbers_mut(&mut overflow.root).blocks = u64::MAX;
+        assert!(
+            matches!(primary_volumes(overflow), Reading::Value(ref volumes) if volumes.len() == 1 && volumes[0].paths == ["/home"])
+        );
+    }
+
+    #[test]
+    fn primary_capacity_uses_only_verified_disk_storage_from_either_path() {
+        for (fs_type, source) in [
+            ("nfs4", "server:/home"),
+            ("cifs", "//server/share"),
+            ("fuse.sshfs", "user@server:/home"),
+            ("tmpfs", "tmpfs"),
+            ("fuse", "unspecified"),
+        ] {
+            let mut frame = mounts(43, 63, "/dev/sdb1", "8:17");
+            mount_type(&mut frame, 63, fs_type, source);
+            assert!(
+                matches!(primary_volumes(frame), Reading::Value(ref volumes) if volumes.len() == 1 && volumes[0].paths == ["/"])
+            );
+        }
+        for fs_type in ["nfs", "overlay", "tmpfs"] {
+            let mut frame = mounts(43, 63, "/dev/sdb1", "8:17");
+            mount_type(&mut frame, 43, fs_type, "server:/root");
+            assert!(
+                matches!(primary_volumes(frame), Reading::Value(ref volumes) if volumes.len() == 1 && volumes[0].paths == ["/home"])
+            );
+        }
+        let mut both_remote = mounts(43, 63, "/dev/sdb1", "8:17");
+        mount_type(&mut both_remote, 43, "nfs", "server:/root");
+        mount_type(&mut both_remote, 63, "cifs", "//server/home");
         assert_eq!(
-            primary_volumes(overflow),
+            primary_volumes(both_remote),
+            Reading::Unavailable(UnavailableReason::Missing)
+        );
+        let mut both_unknown = mounts(43, 63, "/dev/sdb1", "8:17");
+        mount_type(&mut both_unknown, 43, "overlay", "overlay");
+        mount_type(&mut both_unknown, 63, "fuse", "local-or-remote");
+        assert_eq!(
+            primary_volumes(both_unknown),
             Reading::Unavailable(UnavailableReason::InvalidData)
+        );
+    }
+
+    #[test]
+    fn independent_path_failures_preserve_verified_capacity_and_recover() {
+        let mut home_fails = mounts(43, 63, "/dev/sdb1", "8:17");
+        mount_type(&mut home_fails, 63, "nfs4", "server:/home");
+        home_fails.home = Err(UnavailableReason::SourceError);
+        assert!(
+            matches!(primary_volumes(home_fails), Reading::Value(ref volumes) if volumes.len() == 1 && volumes[0].paths == ["/"])
+        );
+        let mut root_fails = mounts(43, 63, "/dev/sdb1", "8:17");
+        root_fails.root = Err(UnavailableReason::PermissionDenied);
+        assert!(
+            matches!(primary_volumes(root_fails), Reading::Value(ref volumes) if volumes.len() == 1 && volumes[0].paths == ["/home"])
+        );
+        let mut both_fail = mounts(43, 63, "/dev/sdb1", "8:17");
+        both_fail.root = Err(UnavailableReason::PermissionDenied);
+        both_fail.home = Err(UnavailableReason::SourceError);
+        assert_eq!(
+            primary_volumes(both_fail),
+            Reading::Unavailable(UnavailableReason::PermissionDenied)
+        );
+        assert!(
+            matches!(primary_volumes(mounts(43, 63, "/dev/sdb1", "8:17")), Reading::Value(ref volumes) if volumes.len() == 2)
         );
     }
 
@@ -1133,12 +1268,17 @@ mod tests {
         ));
         fs::create_dir(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o111)).unwrap();
-        let result = open_volume(path.to_str().unwrap());
+        let mountinfo = fs::read_to_string("/proc/self/mountinfo").unwrap();
+        let result = open_volume(path.to_str().unwrap(), &mountinfo);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         fs::remove_dir(&path).unwrap();
         let volume = result.unwrap();
         assert!(volume.mount_id > 0);
-        assert!(volume.numbers.blocks > 0);
+        if mount_class(&mount_identity(&mountinfo, volume.mount_id).unwrap().fs_type)
+            == MountClass::Storage
+        {
+            assert!(volume.numbers.unwrap().blocks > 0);
+        }
     }
 
     #[test]
@@ -1202,11 +1342,14 @@ mod tests {
         );
     }
 
-    struct SharedProbe(Arc<Mutex<u64>>);
+    struct SharedProbe {
+        ticks: Arc<Mutex<u64>>,
+        volume_mode: Arc<AtomicUsize>,
+    }
 
     impl IoProbe for SharedProbe {
         fn network(&mut self) -> io::Result<NetworkFrame> {
-            let mut number = self.0.lock().unwrap();
+            let mut number = self.ticks.lock().unwrap();
             *number += 1;
             Ok(network_frame(
                 "eno2",
@@ -1215,11 +1358,31 @@ mod tests {
             ))
         }
         fn block(&mut self) -> io::Result<Vec<BlockDevice>> {
-            let number = *self.0.lock().unwrap();
+            let number = *self.ticks.lock().unwrap();
             Ok(minimal_blocks(number * 512, number * 1024))
         }
         fn volumes(&mut self) -> io::Result<VolumeFrame> {
-            Ok(mounts(43, 63, "/dev/nvme0n1p3", "0:35"))
+            let mode = self.volume_mode.load(Ordering::SeqCst);
+            let mut frame = if mode == 0 || mode == 4 {
+                mounts(43, 63, "/dev/nvme0n1p3", "0:35")
+            } else {
+                mounts(43, 63, "/dev/sdb1", "8:17")
+            };
+            if mode == 1 || mode == 3 {
+                mount_type(&mut frame, 63, "nfs4", "server:/home");
+            }
+            if mode == 2 || mode == 3 {
+                mount_type(&mut frame, 43, "nfs4", "server:/root");
+            }
+            if mode == 5 {
+                mount_type(&mut frame, 43, "overlay", "overlay");
+                numbers_mut(&mut frame.home).available = 10;
+            }
+            if mode == 6 {
+                frame.root = Err(UnavailableReason::PermissionDenied);
+                numbers_mut(&mut frame.home).available = 5;
+            }
+            Ok(frame)
         }
     }
 
@@ -1238,9 +1401,13 @@ mod tests {
             }
         }
         let ticks = Arc::new(Mutex::new(0));
+        let volume_mode = Arc::new(AtomicUsize::new(0));
         let mut builder = SessionBuilder::new();
         builder
-            .register(FastIo(IoSampler::new(SharedProbe(Arc::clone(&ticks)))))
+            .register(FastIo(IoSampler::new(SharedProbe {
+                ticks: Arc::clone(&ticks),
+                volume_mode: Arc::clone(&volume_mode),
+            })))
             .unwrap();
         let mut session = builder.start().unwrap();
         let started = Instant::now();
@@ -1259,8 +1426,56 @@ mod tests {
             Reading::Unavailable(UnavailableReason::NotYetSampled)
         ));
         assert!(
-            matches!(snapshot.storage.primary_volumes, Reading::Value(ref volumes) if volumes.len() == 1)
+            matches!(snapshot.storage.primary_volumes, Reading::Value(ref volumes) if volumes.len() == 1 && volumes[0].paths == ["/", "/home"])
         );
+        let wait_for_capacity = |expected: Reading<Vec<PrimaryVolume>>| {
+            let started = Instant::now();
+            loop {
+                let current = session.snapshot().storage.primary_volumes;
+                if current == expected {
+                    break;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(1),
+                    "capacity did not update: {current:?}"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let root_only = primary_volumes({
+            let mut frame = mounts(43, 63, "/dev/sdb1", "8:17");
+            mount_type(&mut frame, 63, "nfs4", "server:/home");
+            frame
+        });
+        volume_mode.store(1, Ordering::SeqCst);
+        wait_for_capacity(root_only);
+        let home_only = primary_volumes({
+            let mut frame = mounts(43, 63, "/dev/sdb1", "8:17");
+            mount_type(&mut frame, 43, "nfs4", "server:/root");
+            frame
+        });
+        volume_mode.store(2, Ordering::SeqCst);
+        wait_for_capacity(home_only);
+        let unknown_root = primary_volumes({
+            let mut frame = mounts(43, 63, "/dev/sdb1", "8:17");
+            mount_type(&mut frame, 43, "overlay", "overlay");
+            numbers_mut(&mut frame.home).available = 10;
+            frame
+        });
+        volume_mode.store(5, Ordering::SeqCst);
+        wait_for_capacity(unknown_root);
+        let failed_root = primary_volumes({
+            let mut frame = mounts(43, 63, "/dev/sdb1", "8:17");
+            frame.root = Err(UnavailableReason::PermissionDenied);
+            numbers_mut(&mut frame.home).available = 5;
+            frame
+        });
+        volume_mode.store(6, Ordering::SeqCst);
+        wait_for_capacity(failed_root);
+        volume_mode.store(3, Ordering::SeqCst);
+        wait_for_capacity(Reading::Unavailable(UnavailableReason::Missing));
+        volume_mode.store(4, Ordering::SeqCst);
+        wait_for_capacity(primary_volumes(mounts(43, 63, "/dev/nvme0n1p3", "0:35")));
         session.stop();
         let stopped_at = *ticks.lock().unwrap();
         thread::sleep(Duration::from_millis(25));
