@@ -1451,6 +1451,62 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn repeated_capacity_timeouts_never_overlap_and_then_recover() {
+        let root = std::env::temp_dir().join(format!(
+            "sys-mon-capacity-retry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let script = root.join("helper.sh");
+        let marker = root.join("stall");
+        let pids = root.join("pids");
+        let payload = root.join("payload");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\nif test -f '{}'; then exec sleep 30; fi\ncat '{}'\n",
+                pids.display(),
+                marker.display(),
+                payload.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let good = Reading::Value(vec![PrimaryVolume {
+            paths: vec!["/".into(), "/home".into()],
+            available_bytes: 20,
+            used_bytes: 70,
+            total_bytes: 100,
+        }]);
+        fs::write(&payload, serde_json::to_vec(&good).unwrap()).unwrap();
+        fs::write(&marker, "stall").unwrap();
+        let mut helper = CapacityHelper::with_executable(script, Duration::from_millis(60));
+        for attempt in 1..=5 {
+            assert_eq!(
+                helper.sample(),
+                Reading::Unavailable(UnavailableReason::TimedOut)
+            );
+            let recorded = fs::read_to_string(&pids).unwrap();
+            let spawned: Vec<_> = recorded.lines().collect();
+            assert_eq!(spawned.len(), attempt, "one helper per bounded retry");
+            assert!(
+                spawned
+                    .iter()
+                    .all(|pid| !PathBuf::from(format!("/proc/{pid}")).exists()),
+                "a previous helper survived into another retry"
+            );
+        }
+        fs::remove_file(marker).unwrap();
+        assert_eq!(helper.sample(), good);
+        assert_eq!(fs::read_to_string(&pids).unwrap().lines().count(), 6);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     struct HelperProbeForStop {
         helper: CapacityHelper,
     }
