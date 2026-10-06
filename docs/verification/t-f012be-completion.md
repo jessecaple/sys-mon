@@ -47,9 +47,10 @@ unavailable on this GNOME session. Physical AMD and Intel GPU coverage and a
 weeks-long soak are outside the M2 gate; M1 fixture and later M3 reliability
 evidence describe those limits.
 
-Independent completion review: the first pass is in
+Independent completion review: the final pass is in
 `~/.wayfinder/evidence/wf-48ebf7/t-f012be-independent-review.md`.
 The reviewer closed the network-track finding after verifying the owner's
 approval and the updated specification. The visible title and Clippy failure
-were corrected in this closeout branch. Completion awaits the same reviewer's
-final source and evidence readback.
+were corrected in this closeout branch. The same reviewer verified source
+candidate `6defb3e7bf63e8b071beca671b960612c5329a9b` against integration
+base `45a84b5846f6f8389dcd4935fc0afef4b86df096` and closed both findings.
