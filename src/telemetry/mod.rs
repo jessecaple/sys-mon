@@ -5,6 +5,7 @@
 //! Providers must bound each `sample` call. Potentially stuck vendor or sensor
 //! calls belong in killable helpers, as the temperature provider demonstrates.
 
+mod gpu;
 mod linux;
 
 use std::io;
@@ -13,11 +14,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+pub use gpu::{GpuProvider, run_gpu_helper};
 pub use linux::{
     HostProbe, HostSampler, LinuxHostProbe, TemperatureProvider, run_temperature_helper,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum UnavailableReason {
     NotYetSampled,
     WarmingUp,
@@ -28,31 +30,31 @@ pub enum UnavailableReason {
     TimedOut,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Reading<T> {
     Value(T),
     Unavailable(UnavailableReason),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryAmount {
     pub used_bytes: u64,
     pub total_bytes: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ThresholdKind {
     TargetOrMax,
     Critical,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TemperatureThreshold {
     pub millidegrees_celsius: i64,
     pub kind: ThresholdKind,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Temperature {
     pub millidegrees_celsius: i64,
     pub threshold: Option<TemperatureThreshold>,
@@ -137,7 +139,7 @@ pub struct HostPatch {
     pub swap: Reading<MemoryAmount>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GpuPatch {
     pub usage_percent: Reading<f64>,
     pub vram: Reading<MemoryAmount>,
@@ -427,6 +429,7 @@ impl TelemetrySession {
         let mut builder = Self::builder();
         builder.register(HostSampler::new(LinuxHostProbe))?;
         builder.register(TemperatureProvider::system()?)?;
+        builder.register(GpuProvider::system()?)?;
         builder.start()
     }
 

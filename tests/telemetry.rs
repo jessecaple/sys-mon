@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sys_mon::telemetry::{
-    Clock, GpuPatch, HostPatch, HostProbe, HostSampler, IoPatch, MemoryAmount, NetworkSnapshot,
-    Patch, PrimaryVolume, Provider, ProviderKind, Reading, SessionBuilder, StopToken,
-    StorageSnapshot, TemperatureProvider, UnavailableReason,
+    Clock, GpuPatch, GpuProvider, HostPatch, HostProbe, HostSampler, IoPatch, MemoryAmount,
+    NetworkSnapshot, Patch, PrimaryVolume, Provider, ProviderKind, Reading, SessionBuilder,
+    StopToken, StorageSnapshot, TemperatureProvider, UnavailableReason,
 };
 
 struct Frames {
@@ -185,6 +185,140 @@ fn wait_until(mut condition: impl FnMut() -> bool) {
         );
         thread::sleep(Duration::from_millis(2));
     }
+}
+
+#[test]
+fn gpu_helper_frames_publish_independent_fields_and_recover_after_device_churn() {
+    let root = temp_path("gpu-session");
+    fs::create_dir_all(&root).unwrap();
+    let frame = root.join("frame.json");
+    let script = root.join("gpu-helper.sh");
+    fs::write(&script, format!("#!/bin/sh\ncat '{}'\n", frame.display())).unwrap();
+    let mut permissions = fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&script, permissions).unwrap();
+    let complete = serde_json::json!([{
+        "vendor": "Nvidia", "pci": "0000:01:00.0", "identity": "gpu-1", "ordinal": 0,
+        "patch": {
+            "usage_percent": {"Value": 0.0},
+            "vram": {"Value": {"used_bytes": 1024, "total_bytes": 4096}},
+            "temperature": {"Value": {"millidegrees_celsius": 42000, "threshold": null, "source": "NVIDIA GPU"}}
+        }
+    }]);
+    fs::write(&frame, complete.to_string()).unwrap();
+    let mut builder = SessionBuilder::new();
+    builder
+        .register(
+            GpuProvider::with_executable(script, Duration::from_millis(150))
+                .with_interval(Duration::from_millis(10)),
+        )
+        .unwrap();
+    builder
+        .register(FastHostSampler(HostSampler::new(SourceDrivenHost {
+            sample_number: 0,
+        })))
+        .unwrap();
+    let mut session = builder.start().unwrap();
+    wait_until(|| session.snapshot().gpu.usage_percent == Reading::Value(0.0));
+    assert_eq!(
+        session.snapshot().gpu.vram,
+        Reading::Value(MemoryAmount {
+            used_bytes: 1024,
+            total_bytes: 4096
+        })
+    );
+    assert!(
+        matches!(session.snapshot().gpu.temperature, Reading::Value(ref value) if value.threshold.is_none())
+    );
+    let partial = serde_json::json!([{
+        "vendor": "Nvidia", "pci": "0000:01:00.0", "identity": "gpu-1", "ordinal": 0,
+        "patch": {
+            "usage_percent": {"Unavailable": "PermissionDenied"},
+            "vram": {"Value": {"used_bytes": 2048, "total_bytes": 4096}},
+            "temperature": {"Unavailable": "Missing"}
+        }
+    }]);
+    fs::write(&frame, partial.to_string()).unwrap();
+    wait_until(|| {
+        session.snapshot().gpu.vram
+            == Reading::Value(MemoryAmount {
+                used_bytes: 2048,
+                total_bytes: 4096,
+            })
+    });
+    assert_eq!(
+        session.snapshot().gpu.usage_percent,
+        Reading::Unavailable(UnavailableReason::PermissionDenied)
+    );
+    assert_eq!(
+        session.snapshot().gpu.temperature,
+        Reading::Unavailable(UnavailableReason::Missing)
+    );
+    fs::write(&frame, "[]").unwrap();
+    wait_until(|| session.snapshot().gpu.vram == Reading::Unavailable(UnavailableReason::Missing));
+    assert!(matches!(
+        session.snapshot().cpu.usage_percent,
+        Reading::Value(_)
+    ));
+    fs::write(&frame, complete.to_string()).unwrap();
+    wait_until(|| {
+        session.snapshot().gpu.vram
+            == Reading::Value(MemoryAmount {
+                used_bytes: 1024,
+                total_bytes: 4096,
+            })
+    });
+    session.stop();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn stalled_gpu_helper_is_killed_without_stalling_host_or_stop() {
+    let root = temp_path("gpu-stall");
+    fs::create_dir_all(&root).unwrap();
+    let pids = root.join("pids");
+    let script = root.join("gpu-helper.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\nexec sleep 10\n",
+            pids.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&script, permissions).unwrap();
+    let mut builder = SessionBuilder::new();
+    builder
+        .register(
+            GpuProvider::with_executable(script, Duration::from_millis(40))
+                .with_interval(Duration::from_millis(10)),
+        )
+        .unwrap();
+    builder
+        .register(FastHostSampler(HostSampler::new(SourceDrivenHost {
+            sample_number: 0,
+        })))
+        .unwrap();
+    let mut session = builder.start().unwrap();
+    wait_until(|| {
+        session.snapshot().gpu.usage_percent == Reading::Unavailable(UnavailableReason::TimedOut)
+    });
+    assert!(matches!(
+        session.snapshot().cpu.usage_percent,
+        Reading::Value(_)
+    ));
+    let started = Instant::now();
+    session.stop();
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let recorded = fs::read_to_string(&pids).unwrap();
+    let ids: Vec<_> = recorded.lines().collect();
+    assert!(!ids.is_empty() && ids.len() <= 2);
+    for pid in ids {
+        assert!(!PathBuf::from(format!("/proc/{pid}")).exists());
+    }
+    fs::remove_dir_all(root).unwrap();
 }
 
 struct SourceDrivenHost {
