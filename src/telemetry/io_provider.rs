@@ -6,9 +6,10 @@ use super::{
     StorageSnapshot, UnavailableReason,
 };
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
+use std::ffi::CString;
+use std::fs;
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -16,8 +17,18 @@ const MAX_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy)]
 struct Counters {
-    down: u64,
-    up: u64,
+    down: Option<u64>,
+    up: Option<u64>,
+}
+
+#[cfg(test)]
+impl Counters {
+    fn both(down: u64, up: u64) -> Self {
+        Self {
+            down: Some(down),
+            up: Some(up),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -184,7 +195,19 @@ fn invalid_input(message: &'static str) -> io::Error {
 }
 
 fn open_volume(path: &str) -> io::Result<OpenVolume> {
-    let file = File::open(path)?;
+    let path = CString::new(path).map_err(|_| invalid_input("invalid volume path"))?;
+    // O_PATH needs search permission on ancestors, but not read permission on
+    // the mounted directory itself. Keep one descriptor for identity and size.
+    let raw_fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if raw_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let file = unsafe { OwnedFd::from_raw_fd(raw_fd) };
     let fdinfo = fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?;
     let mount_id = fdinfo
         .lines()
@@ -227,8 +250,8 @@ fn parse_net_dev(text: &str, name: &str) -> Option<Counters> {
         return None;
     }
     Some(Counters {
-        down: fields[0].parse().ok()?,
-        up: fields[8].parse().ok()?,
+        down: fields[0].parse().ok(),
+        up: fields[8].parse().ok(),
     })
 }
 
@@ -293,8 +316,14 @@ fn parse_block_stat(text: &str) -> Option<Counters> {
         return None;
     }
     Some(Counters {
-        down: fields[2].parse::<u64>().ok()?.checked_mul(512)?,
-        up: fields[6].parse::<u64>().ok()?.checked_mul(512)?,
+        down: fields[2]
+            .parse::<u64>()
+            .ok()
+            .and_then(|value| value.checked_mul(512)),
+        up: fields[6]
+            .parse::<u64>()
+            .ok()
+            .and_then(|value| value.checked_mul(512)),
     })
 }
 
@@ -454,6 +483,20 @@ fn rate(current: u64, prior: u64, elapsed: Duration, prior_at: Duration) -> Read
     }
 }
 
+fn direction_rate(
+    current: Option<u64>,
+    previous: Option<(u64, Duration)>,
+    elapsed: Duration,
+) -> Reading<f64> {
+    let Some(current) = current else {
+        return Reading::Unavailable(UnavailableReason::InvalidData);
+    };
+    match previous {
+        Some((prior, prior_at)) => rate(current, prior, elapsed, prior_at),
+        None => Reading::Unavailable(UnavailableReason::WarmingUp),
+    }
+}
+
 pub(super) struct IoSampler {
     probe: Box<dyn IoProbe>,
     network_previous: Option<(String, Counters, Duration)>,
@@ -511,14 +554,21 @@ impl IoSampler {
             return unavailable(UnavailableReason::InvalidData);
         };
         let identity = format!("{}:{}", link.name, link.ifindex);
-        let result = match &self.network_previous {
-            Some((previous_id, previous, previous_at)) if *previous_id == identity => {
-                NetworkSnapshot {
-                    down_bytes_per_second: rate(current.down, previous.down, elapsed, *previous_at),
-                    up_bytes_per_second: rate(current.up, previous.up, elapsed, *previous_at),
-                }
-            }
-            _ => unavailable(UnavailableReason::WarmingUp),
+        let previous = self
+            .network_previous
+            .as_ref()
+            .and_then(|(id, counters, at)| (id == &identity).then_some((counters, *at)));
+        let result = NetworkSnapshot {
+            down_bytes_per_second: direction_rate(
+                current.down,
+                previous.and_then(|(counters, at)| counters.down.map(|value| (value, at))),
+                elapsed,
+            ),
+            up_bytes_per_second: direction_rate(
+                current.up,
+                previous.and_then(|(counters, at)| counters.up.map(|value| (value, at))),
+                elapsed,
+            ),
         };
         self.network_previous = Some((identity, current, elapsed));
         result
@@ -563,22 +613,26 @@ impl IoSampler {
                 }
             };
             let identity = format!("{}:{}", device.name, device.identity);
-            if let Some((prior, at)) = self.block_previous.get(&identity) {
-                match rate(current.down, prior.down, elapsed, *at) {
-                    Reading::Value(value) => down += value,
-                    Reading::Unavailable(reason) => {
-                        down_error.get_or_insert(reason);
-                    }
+            let previous = self.block_previous.get(&identity);
+            match direction_rate(
+                current.down,
+                previous.and_then(|(prior, at)| prior.down.map(|value| (value, *at))),
+                elapsed,
+            ) {
+                Reading::Value(value) => down += value,
+                Reading::Unavailable(reason) => {
+                    down_error.get_or_insert(reason);
                 }
-                match rate(current.up, prior.up, elapsed, *at) {
-                    Reading::Value(value) => up += value,
-                    Reading::Unavailable(reason) => {
-                        up_error.get_or_insert(reason);
-                    }
+            }
+            match direction_rate(
+                current.up,
+                previous.and_then(|(prior, at)| prior.up.map(|value| (value, *at))),
+                elapsed,
+            ) {
+                Reading::Value(value) => up += value,
+                Reading::Unavailable(reason) => {
+                    up_error.get_or_insert(reason);
                 }
-            } else {
-                down_error.get_or_insert(UnavailableReason::WarmingUp);
-                up_error.get_or_insert(UnavailableReason::WarmingUp);
             }
             next.insert(identity, (current, elapsed));
         }
@@ -605,6 +659,7 @@ mod tests {
     use super::*;
     use crate::telemetry::{SessionBuilder, Snapshot};
     use std::collections::VecDeque;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Instant;
@@ -667,7 +722,7 @@ mod tests {
             slaves: Vec::new(),
             held,
             synthetic: false,
-            counters: Ok(Counters { down, up }),
+            counters: Ok(Counters::both(down, up)),
         }
     }
 
@@ -808,12 +863,16 @@ mod tests {
             .routes4
             .push_str("wg0 00000000 00000000 0001 0 0 50 00000000 0 0 0\n");
         assert_eq!(selected_link(&frame).unwrap().name, "eno2");
-        assert_eq!(parse_net_dev(&frame.dev, "eno2").unwrap().down, 10);
+        assert_eq!(parse_net_dev(&frame.dev, "eno2").unwrap().down, Some(10));
         frame.dev = "eno2: broken\n".into();
         assert!(parse_net_dev(&frame.dev, "eno2").is_none());
         assert!(parse_block_stat("1 2 3 4 5 6 7").is_some());
-        assert!(parse_block_stat("1 2 nope 4 5 6 7").is_none());
-        assert!(parse_block_stat(&format!("1 2 {} 4 5 6 7", u64::MAX)).is_none());
+        let partial = parse_block_stat("1 2 nope 4 5 6 7").unwrap();
+        assert_eq!(partial.down, None);
+        assert_eq!(partial.up, Some(7 * 512));
+        let overflow = parse_block_stat(&format!("1 2 {} 4 5 6 7", u64::MAX)).unwrap();
+        assert_eq!(overflow.down, None);
+        assert_eq!(overflow.up, Some(7 * 512));
     }
 
     #[test]
@@ -1059,6 +1118,87 @@ mod tests {
         assert_eq!(
             primary_volumes(overflow),
             Reading::Unavailable(UnavailableReason::InvalidData)
+        );
+    }
+
+    #[test]
+    fn searchable_only_directory_still_supplies_mount_identity_and_capacity() {
+        let path = std::env::temp_dir().join(format!(
+            "sys-mon-io-search-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o111)).unwrap();
+        let result = open_volume(path.to_str().unwrap());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir(&path).unwrap();
+        let volume = result.unwrap();
+        assert!(volume.mount_id > 0);
+        assert!(volume.numbers.blocks > 0);
+    }
+
+    #[test]
+    fn a_malformed_direction_clears_only_its_own_rate_baseline() {
+        let mut frames = frames(
+            vec![
+                network_frame("eno2", (100, 100), (0, 0)),
+                network_frame("eno2", (150, 150), (0, 0)),
+                network_frame("eno2", (200, 200), (0, 0)),
+                network_frame("eno2", (250, 250), (0, 0)),
+            ],
+            vec![
+                minimal_blocks(0, 0),
+                minimal_blocks(100, 100),
+                minimal_blocks(200, 200),
+                minimal_blocks(300, 300),
+            ],
+            4,
+        );
+        frames.network[1].as_mut().unwrap().dev =
+            "eno2: bad 0 0 0 0 0 0 0 150 0 0 0 0 0 0 0\n".into();
+        frames.block[1].as_mut().unwrap()[0].counters = Ok(Counters {
+            down: None,
+            up: Some(100),
+        });
+        let mut sampler = IoSampler::new(frames);
+        sampler.tick(Duration::ZERO);
+        let partial = sampler.tick(Duration::from_secs(1));
+        assert_eq!(
+            partial.network.down_bytes_per_second,
+            Reading::Unavailable(UnavailableReason::InvalidData)
+        );
+        assert_eq!(partial.network.up_bytes_per_second, Reading::Value(50.0));
+        assert_eq!(
+            partial.storage.read_bytes_per_second,
+            Reading::Unavailable(UnavailableReason::InvalidData)
+        );
+        assert_eq!(
+            partial.storage.write_bytes_per_second,
+            Reading::Value(100.0)
+        );
+        let warm = sampler.tick(Duration::from_secs(2));
+        assert_eq!(
+            warm.network.down_bytes_per_second,
+            Reading::Unavailable(UnavailableReason::WarmingUp)
+        );
+        assert_eq!(warm.network.up_bytes_per_second, Reading::Value(50.0));
+        assert_eq!(
+            warm.storage.read_bytes_per_second,
+            Reading::Unavailable(UnavailableReason::WarmingUp)
+        );
+        assert_eq!(warm.storage.write_bytes_per_second, Reading::Value(100.0));
+        let recovered = sampler.tick(Duration::from_secs(3));
+        assert_eq!(
+            recovered.network.down_bytes_per_second,
+            Reading::Value(50.0)
+        );
+        assert_eq!(
+            recovered.storage.read_bytes_per_second,
+            Reading::Value(100.0)
         );
     }
 
