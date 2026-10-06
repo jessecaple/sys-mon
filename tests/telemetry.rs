@@ -590,6 +590,7 @@ fn provider_interleaving_preserves_disjoint_fields_and_stop_ends_all_workers() {
                 primary_volumes: Reading::Value(vec![PrimaryVolume {
                     paths: vec!["/".into(), "/home".into()],
                     available_bytes: 5,
+                    used_bytes: 5,
                     total_bytes: 10,
                 }]),
             },
