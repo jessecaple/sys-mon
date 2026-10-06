@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 pub use gpu::{GpuProvider, run_gpu_helper};
 use io_provider::IoSampler;
+pub use io_provider::run_capacity_helper;
 pub use linux::{
     HostProbe, HostSampler, LinuxHostProbe, TemperatureProvider, run_temperature_helper,
 };
@@ -82,7 +83,7 @@ pub struct NetworkSnapshot {
     pub up_bytes_per_second: Reading<f64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PrimaryVolume {
     pub paths: Vec<String>,
     pub available_bytes: u64,

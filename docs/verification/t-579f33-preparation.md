@@ -44,3 +44,49 @@ storage. Physical AMD/Intel GPU compatibility, remote mounts, another desktop
 backend and an actual weeks-long soak remain explicitly unverified unless
 separately exercised. No fixed resource ceiling is acceptance; measurements
 must instead expose sustained growth, accumulating workers or runaway CPU.
+
+## Review finding: bounded primary-capacity lookup
+
+Code review found that `LinuxIoProbe::volumes` opens `/home` before mount
+classification. A stalled remote or automounted pathname can hold the I/O
+worker inside `open` despite the existing field-local error handling. Session
+stop joins that worker, and the dashboard waits for stop before quitting.
+This is a production shutdown defect that local Btrfs stress cannot expose.
+
+Keep network and block-rate baselines in the existing I/O worker. Move only
+primary-capacity discovery, mount identity and `fstatvfs` into the same
+executable's new internal capacity-helper mode. The helper returns the current
+`Reading<Vec<PrimaryVolume>>`; no rate baseline or historical state crosses
+the process boundary. The production I/O probe obtains it through one
+bounded child at a time. Refactor the private `IoProbe::volumes` seam to a
+`capacity` reading; fixture probes compute that reading from their existing
+`VolumeFrame` inputs. The public snapshot shape and UI consumer do not change.
+
+The I/O worker owns the helper handle and holds no shared snapshot lock while
+waiting. The helper has a 650 ms sampling timeout, an 8 KiB output limit and
+one bounded 100 ms kill/reap attempt. If a previous child cannot yet be
+reaped, retain that one handle and report timeout rather than spawn another.
+The worker's normal one-second sleep follows each attempt, so there is no
+overlap, catch-up queue or unbounded retry. Stop may wait for the current
+bounded attempt, then the session generation gate prevents a late patch.
+`Drop` retries kill/reap without an unbounded wait. A kernel task in
+uninterruptible sleep cannot be guaranteed to disappear immediately, which
+also applies to the existing GPU and temperature helpers; the process count
+remains capped at one for this source.
+
+Any helper error, malformed/oversized response, timeout or missing source
+replaces capacity with an unavailable reading on that tick. Network and block
+rate fields retain their separate current results. A later successful helper
+run recovers capacity without a retained baseline. Existing mount identity,
+shared Btrfs deduplication, local-storage classification and ordinary-user
+available-space rules stay inside the child unchanged. No schema migration,
+persisted data or new product surface is involved.
+
+Focused witnesses: valid shared/distinct capacity via the helper process;
+failure and recovery while network/block values continue; an intentionally
+stuck helper that times out without overlapping children and allows
+`TelemetrySession::stop`; malformed and greater-than-8-KiB helper output that
+affects capacity only and later recovers; and native close while a helper
+identified by `--internal-capacity-probe` is in flight. Existing capacity
+fixtures continue checking source semantics through the private probe seam.
+Live Btrfs readback must still match the old contract.
