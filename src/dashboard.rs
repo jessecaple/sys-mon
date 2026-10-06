@@ -1,0 +1,346 @@
+//! The single native overview window.
+
+use std::cell::{Cell as LocalCell, RefCell};
+use std::rc::Rc;
+use std::time::Duration;
+
+use adw::prelude::*;
+use gtk::glib;
+
+use crate::presentation::{Cell, DisplayLine, present};
+use crate::telemetry::{Reading, Snapshot, TelemetrySession, UnavailableReason};
+
+const STYLE: &str = r#"
+.dashboard { padding: 8px 16px 16px; }
+.metric-cell { min-height: 5.2em; padding-top: 0.8em; border-bottom: 1px solid alpha(@window_fg_color, 0.13); }
+.metric-left { border-right: 1px solid alpha(@window_fg_color, 0.13); }
+.metric-glyph { color: @window_fg_color; font-size: 1.15em; min-width: 1.4em; }
+.metric-name { color: alpha(@window_fg_color, 0.75); font-size: 0.85em; font-weight: 600; min-width: 8em; }
+.metric-value { color: @window_fg_color; font-size: 1.45em; font-weight: 700; font-feature-settings: "tnum"; }
+.metric-missing { color: alpha(@window_fg_color, 0.62); font-size: 1em; font-weight: 500; }
+.metric-rail { margin-top: 2px; min-height: 3px; }
+.metric-rail trough { min-height: 3px; border-radius: 0; background: alpha(@window_fg_color, 0.18); }
+.metric-rail progress { min-height: 3px; border-radius: 0; background: @window_fg_color; }
+"#;
+
+fn glyph(name: &str) -> &'static str {
+    match name {
+        "cpu" => "▣",
+        "temperature" => "♨",
+        "ram" => "▤",
+        "swap" => "⇄",
+        "gpu" => "◉",
+        "vram" => "▦",
+        "storage" => "◫",
+        "network-down" => "↓",
+        "network-up" => "↑",
+        "storage-read" => "↘",
+        "storage-write" => "↗",
+        _ => "•",
+    }
+}
+
+struct CellWidget {
+    body: gtk::Box,
+    last: RefCell<Option<Cell>>,
+}
+
+impl CellWidget {
+    fn new(left: bool) -> Self {
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        body.add_css_class("metric-cell");
+        if left {
+            body.add_css_class("metric-left");
+        }
+        body.set_hexpand(true);
+        Self {
+            body,
+            last: RefCell::new(None),
+        }
+    }
+
+    fn update(&self, cell: &Cell) {
+        if self.last.borrow().as_ref() == Some(cell) {
+            return;
+        }
+        while let Some(child) = self.body.first_child() {
+            self.body.remove(&child);
+        }
+        let grid = gtk::Grid::new();
+        grid.set_column_spacing(7);
+        grid.set_row_spacing(2);
+        grid.set_hexpand(true);
+        grid.set_vexpand(true);
+        grid.set_margin_start(14);
+        grid.set_margin_end(14);
+
+        let icon = gtk::Label::new(Some(glyph(cell.glyph)));
+        icon.add_css_class("metric-glyph");
+        icon.set_accessible_role(gtk::AccessibleRole::Presentation);
+        icon.set_xalign(0.0);
+        grid.attach(&icon, 0, 0, 1, 1);
+
+        let name = gtk::Label::new(Some(cell.label));
+        name.add_css_class("metric-name");
+        name.set_xalign(0.0);
+        grid.attach(&name, 1, 0, 1, 1);
+
+        let mut rails = Vec::new();
+        for (index, line) in cell.lines.iter().enumerate() {
+            let value = value_label(line);
+            grid.attach(&value, 2, index as i32, 1, 1);
+            if let Some(fraction) = line.rail {
+                let rail = gtk::ProgressBar::new();
+                rail.set_fraction(fraction);
+                rail.add_css_class("metric-rail");
+                rail.update_property(&[
+                    gtk::accessible::Property::Label(&line.description),
+                    gtk::accessible::Property::ValueMin(0.0),
+                    gtk::accessible::Property::ValueMax(100.0),
+                    gtk::accessible::Property::ValueNow(fraction * 100.0),
+                ]);
+                rails.push(rail);
+            }
+        }
+        self.body.append(&grid);
+        for rail in rails {
+            self.body.append(&rail);
+        }
+        *self.last.borrow_mut() = Some(cell.clone());
+    }
+}
+
+fn value_label(line: &DisplayLine) -> gtk::Label {
+    let value = gtk::Label::new(Some(&line.value));
+    value.set_xalign(0.0);
+    value.set_hexpand(true);
+    value.add_css_class("metric-value");
+    if line.rail.is_none()
+        && matches!(
+            line.value.as_str(),
+            "Waiting"
+                | "Unavailable"
+                | "No access"
+                | "Invalid reading"
+                | "Source error"
+                | "Timed out"
+        )
+    {
+        value.add_css_class("metric-missing");
+    }
+    value.update_property(&[gtk::accessible::Property::Label(&line.description)]);
+    value
+}
+
+fn install_style() {
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(STYLE);
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+}
+
+fn build_window(app: &adw::Application, fixture: Option<&Snapshot>) {
+    if let Some(window) = app.active_window() {
+        window.present();
+        return;
+    }
+    install_style();
+    let window = adw::ApplicationWindow::builder()
+        .application(app)
+        .title("sys-mon")
+        .default_width(860)
+        .default_height(540)
+        .build();
+    window.set_size_request(700, 490);
+
+    let layout = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let header = adw::HeaderBar::new();
+    header.set_show_title(false);
+    layout.append(&header);
+
+    let grid = gtk::Grid::new();
+    grid.set_column_homogeneous(true);
+    grid.add_css_class("dashboard");
+    grid.set_hexpand(true);
+    grid.set_vexpand(true);
+    let widgets: Rc<Vec<CellWidget>> =
+        Rc::new((0..12).map(|i| CellWidget::new(i % 2 == 0)).collect());
+    for (index, widget) in widgets.iter().enumerate() {
+        grid.attach(&widget.body, (index % 2) as i32, (index / 2) as i32, 1, 1);
+    }
+    layout.append(&grid);
+    window.set_content(Some(&layout));
+
+    let session = if fixture.is_some() {
+        None
+    } else {
+        match TelemetrySession::start_system() {
+            Ok(session) => Some(session),
+            Err(error) => {
+                eprintln!("telemetry could not start: {error}");
+                None
+            }
+        }
+    };
+    let session = Rc::new(RefCell::new(session));
+    let stopping = Rc::new(LocalCell::new(false));
+
+    let initial_snapshot = fixture.cloned().unwrap_or_else(|| {
+        if session.borrow().is_some() {
+            Snapshot::default()
+        } else {
+            startup_failed_snapshot()
+        }
+    });
+    let initial = present(&initial_snapshot);
+    for (widget, cell) in widgets.iter().zip(initial.iter()) {
+        widget.update(cell);
+    }
+    let session_for_tick = Rc::clone(&session);
+    let widgets_for_tick = Rc::clone(&widgets);
+    let stopping_for_tick = Rc::clone(&stopping);
+    if fixture.is_none() {
+        glib::timeout_add_local(Duration::from_secs(1), move || {
+            if stopping_for_tick.get() {
+                return glib::ControlFlow::Break;
+            }
+            if let Some(session) = session_for_tick.borrow().as_ref() {
+                let cells = present(&session.snapshot());
+                for (widget, cell) in widgets_for_tick.iter().zip(cells.iter()) {
+                    widget.update(cell);
+                }
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    let app_for_close = app.clone();
+    let session_for_close = Rc::clone(&session);
+    window.connect_close_request(move |window| {
+        if stopping.replace(true) {
+            return glib::Propagation::Stop;
+        }
+        window.set_visible(false);
+        if let Some(mut session) = session_for_close.borrow_mut().take() {
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                session.stop();
+                let _ = done_tx.send(());
+            });
+            let app = app_for_close.clone();
+            glib::timeout_add_local(Duration::from_millis(40), move || {
+                match done_rx.try_recv() {
+                    Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        app.quit();
+                        glib::ControlFlow::Break
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                }
+            });
+        } else {
+            app_for_close.quit();
+        }
+        glib::Propagation::Stop
+    });
+    window.present();
+}
+
+fn startup_failed_snapshot() -> Snapshot {
+    fn failed<T>() -> Reading<T> {
+        Reading::Unavailable(UnavailableReason::SourceError)
+    }
+    let mut snapshot = Snapshot::default();
+    snapshot.cpu.usage_percent = failed();
+    snapshot.cpu.temperature = failed();
+    snapshot.ram = failed();
+    snapshot.swap = failed();
+    snapshot.gpu.usage_percent = failed();
+    snapshot.gpu.vram = failed();
+    snapshot.gpu.temperature = failed();
+    snapshot.network.down_bytes_per_second = failed();
+    snapshot.network.up_bytes_per_second = failed();
+    snapshot.storage.read_bytes_per_second = failed();
+    snapshot.storage.write_bytes_per_second = failed();
+    snapshot.storage.primary_volumes = failed();
+    snapshot
+}
+
+pub fn run() {
+    run_with_snapshot(None);
+}
+
+fn run_with_snapshot(snapshot: Option<Snapshot>) {
+    let app = adw::Application::builder()
+        .application_id("io.github.sys_mon.SysMon")
+        .build();
+    app.connect_activate(move |app| build_window(app, snapshot.as_ref()));
+    app.run_with_args(&["sys-mon"]);
+}
+
+#[cfg(debug_assertions)]
+pub fn run_fixture(case: &str) -> Result<(), &'static str> {
+    use crate::telemetry::{MemoryAmount, PrimaryVolume};
+
+    let mut snapshot = Snapshot::default();
+    match case {
+        "unavailable" => {
+            snapshot.cpu.usage_percent = Reading::Unavailable(UnavailableReason::SourceError);
+            snapshot.cpu.temperature = Reading::Unavailable(UnavailableReason::Missing);
+            snapshot.ram = Reading::Value(MemoryAmount {
+                used_bytes: 0,
+                total_bytes: 0,
+            });
+            snapshot.swap = Reading::Unavailable(UnavailableReason::PermissionDenied);
+            snapshot.gpu.usage_percent = Reading::Value(0.0);
+            snapshot.gpu.temperature = Reading::Unavailable(UnavailableReason::TimedOut);
+            snapshot.gpu.vram = Reading::Unavailable(UnavailableReason::Missing);
+            snapshot.storage.primary_volumes = Reading::Unavailable(UnavailableReason::Missing);
+            snapshot.network.down_bytes_per_second = Reading::Value(0.0);
+            snapshot.network.up_bytes_per_second =
+                Reading::Unavailable(UnavailableReason::WarmingUp);
+            snapshot.storage.read_bytes_per_second = Reading::Value(0.0);
+            snapshot.storage.write_bytes_per_second =
+                Reading::Unavailable(UnavailableReason::InvalidData);
+        }
+        "distinct-storage" => {
+            snapshot.storage.primary_volumes = Reading::Value(vec![
+                PrimaryVolume {
+                    paths: vec!["/".into()],
+                    available_bytes: 312 * 1024 * 1024 * 1024,
+                    used_bytes: 688 * 1024 * 1024 * 1024,
+                    total_bytes: 1000 * 1024 * 1024 * 1024,
+                },
+                PrimaryVolume {
+                    paths: vec!["/home".into()],
+                    available_bytes: 80 * 1024 * 1024 * 1024,
+                    used_bytes: 120 * 1024 * 1024 * 1024,
+                    total_bytes: 200 * 1024 * 1024 * 1024,
+                },
+            ]);
+        }
+        _ => return Err("unknown dashboard fixture"),
+    }
+    run_with_snapshot(Some(snapshot));
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_failure_has_no_permanent_waiting_cells() {
+        let cells = present(&startup_failed_snapshot());
+        for cell in cells {
+            for line in cell.lines {
+                assert_eq!(line.value, "Source error");
+                assert!(line.rail.is_none());
+            }
+        }
+    }
+}

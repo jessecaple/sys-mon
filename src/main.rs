@@ -28,5 +28,15 @@ fn main() {
         return;
     }
 
-    println!("sys-mon telemetry is ready; the desktop overview is under construction");
+    #[cfg(debug_assertions)]
+    if std::env::args().nth(1).as_deref() == Some("--internal-dashboard-fixture") {
+        let case = std::env::args().nth(2).unwrap_or_default();
+        if let Err(error) = sys_mon::dashboard::run_fixture(&case) {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+        return;
+    }
+
+    sys_mon::dashboard::run();
 }
