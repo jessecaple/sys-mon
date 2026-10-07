@@ -48,6 +48,11 @@ artifacts and packages are outside acceptance.
 
 ## Independent completion review
 
-Pending review by a `wayfinder-requirements-reviewer` who did not implement
-M3 work or author its inventories. The reviewer must inspect the milestone
-description, source, approved exception and qualified evidence for every row.
+`/root/m3_requirements_review`, a `wayfinder-requirements-reviewer` who did
+not implement M3 work or author its inventories, independently inspected the
+milestone description, approved public-source-only exception, source, test
+assertions, native stress and shutdown records, screenshots, and current
+public repository readbacks. The reviewer verified every row against
+integration `6b1ecf2` and found zero gaps or open findings. The durable
+[review receipt](/home/jcaple/.wayfinder/evidence/wf-48ebf7/t-8aeab6-independent-review.md)
+records the comparison and verification limits.
