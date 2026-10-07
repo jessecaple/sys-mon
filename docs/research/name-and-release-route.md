@@ -1,5 +1,10 @@
 # Name and release route research
 
+Historical decision research. The owner chose `sys-mon` and later narrowed
+publication to a public source repository without a GitHub Release or binary
+packages. The [specification](../wf-48ebf7-spec.md) and current Wayfinder M3
+scope supersede the name and release-route recommendations below.
+
 Researched 2026-10-05 for decision ticket `wf-48ebf7/t-61933c`. This is a recommendation, not an owner naming decision, trademark clearance, package implementation, or publication.
 
 ## Recommended name

@@ -53,14 +53,14 @@ Efficiency and reliability are implementation requirements. The owner rejected a
 16. As a user leaving the monitor open, I want retained work and memory to stay bounded, so that the monitor does not degrade a long session.
 17. As a user closing the window, I want all collection and application processes to stop, so that there is no hidden background monitor.
 18. As someone installing sys-mon, I want native installation instructions and accurate runtime requirements, so that I can run it on a supported system.
-19. As someone evaluating a release, I want an honest record of tested hardware and unverified paths, so that fixture coverage is not confused with physical hardware validation.
+19. As someone evaluating the public source, I want an honest record of tested hardware and unverified paths, so that fixture coverage is not confused with physical hardware validation.
 20. As someone using or contributing to the project, I want its source published under MIT in the owner's personal public repository, so that its implementation and license are available.
 
 ## Implementation Decisions
 
 ### Native application and visual contract
 
-Use matched Rust GTK4/libadwaita bindings. The repository currently contains a minimal Cargo package named `sys-mon` and a hello-world entry point; there is no existing application architecture or test harness to preserve. Keep the public telemetry boundary small and hide provider-specific parsing, discovery and driver handling behind it. The native UI consumes coherent current snapshots.
+Use matched Rust GTK4/libadwaita bindings. Keep the public telemetry boundary small and hide provider-specific parsing, discovery and driver handling behind it. The native UI consumes coherent current snapshots.
 
 The final prototype amendments take precedence over earlier design proposals: monochrome replaces component colors; current status replaces graphs; the overview has no internal heading, secondary views, expansion controls or tabs. Native window decorations remain normal desktop behavior.
 
@@ -107,13 +107,13 @@ Handle slow or stuck optional providers so they cannot block shutdown, accumulat
 
 Closing the sole window ends scheduling, collection, owned helpers and the application. Verify this with normal operation, errors and in-flight collection. Minimized-window behavior requires no new product feature; avoid unnecessary painting and keep any continuing collection bounded. Exact desktop placement is outside scope.
 
-### Publication and installation
+### Public source and installation
 
-Use lowercase **sys-mon** for the displayed product and intended executable, Cargo package and repository basename. Recheck final repository, application and package identifiers immediately before publication without reopening the rejected acronym exercise.
+Use lowercase **sys-mon** for the displayed product, executable, Cargo package and repository basename. Recheck final repository, application and desktop identifiers immediately before publication without reopening the rejected acronym exercise.
 
-Publish source and a release in the owner's personal public GitHub account with the MIT license. Supply native installation/release packaging and source-build instructions, appropriate desktop metadata, and explicit GTK/libadwaita/runtime dependencies. The packaging research recommends native RPM/DEB packages; the actual supported distro versions and architectures must be established from build and installation evidence during release preparation. Do not claim an untested support matrix.
+Publish MIT-licensed source in the owner's personal public GitHub account. Supply source-build and local installation instructions, appropriate desktop metadata, and explicit GTK/libadwaita/runtime dependencies. Record MIT in Cargo metadata and retain separate notices for bundled third-party material. The owner corrected the scope on 2026-10-06: a public repository is the deliverable, with no GitHub Release, version tag, native RPM/DEB packages or downloadable artifacts. Do not claim an untested distribution or architecture support matrix.
 
-Document metric availability and ordinary-user permission limits. The release evidence must distinguish live hardware checks, fixture checks and unverified paths, including display backends actually exercised. Include reproducible verification commands and observed outcomes. Publication and packaging have not occurred merely because this specification exists.
+Document metric availability and ordinary-user permission limits. Publication evidence must distinguish live hardware checks, fixture checks and unverified paths, including display backends actually exercised. Include reproducible verification commands and observed outcomes. The repository's public visibility, license and published commit require readback after publication.
 
 ## Testing Decisions
 
@@ -133,7 +133,7 @@ Verify the native window against the approved screenshots with live telemetry an
 
 Perform a practical local run under ordinary use and representative CPU/GPU/storage activity. Check responsiveness and resource behavior for busy loops, leaked state, growing queues, repeated worker creation or runaway retrying. Fix any observed defects. The live NVIDIA path is checked on the available host; AMD/Intel fixtures establish software behavior, not physical compatibility.
 
-No earlier proposed CPU/RAM number, fixed growth allowance, two-hour soak, 30-minute stress duration or two-second exit deadline was approved. The acceptance gate is correct, bounded behavior supported by meaningful tests and practical live verification. An actual weeks-long run and physical unavailable GPUs are not release gates. Test harness timeouts are engineering safeguards, not product performance promises.
+No earlier proposed CPU/RAM number, fixed growth allowance, two-hour soak, 30-minute stress duration or two-second exit deadline was approved. The acceptance gate is correct, bounded behavior supported by meaningful tests and practical live verification. An actual weeks-long run and physical unavailable GPUs are not publication requirements. Test harness timeouts are engineering safeguards, not product performance promises.
 
 ## Out of Scope
 
@@ -142,8 +142,9 @@ No earlier proposed CPU/RAM number, fixed growth allowance, two-hour soak, 30-mi
 - Exact window-position restoration or control of GNOME Wayland placement.
 - A dedicated tuning or preliminary benchmarking project and arbitrary numeric resource-budget acceptance gates.
 - Renaming the product through another acronym exercise.
+- A GitHub Release, version tag, native RPM/DEB packages and downloadable binary artifacts.
 
-Flatpak/AppImage distribution is not part of the settled first-release route; do not add it from historical research alone. Unavailable physical hardware and a weeks-long soak are verification limitations to disclose, rather than prerequisites to publication.
+Flatpak/AppImage distribution is also outside this public-source scope. Unavailable physical hardware and a weeks-long soak are verification limitations to disclose, rather than prerequisites to publication.
 
 ## Further Notes
 
@@ -153,8 +154,8 @@ Evidence references:
 
 - [Linux metric sources](research/linux-metric-sources.md).
 - [Rust desktop stack research](research/rust-desktop-graph-stack.md).
-- [Release packaging research](research/name-and-release-route.md); its proposed name is obsolete.
+- [Historical name and packaging research](research/name-and-release-route.md); its proposed name and release route were superseded by owner decisions.
 
-Provider/runtime availability for Intel, CPU sensor attribution on other machines, exact supported dependency versions, and distro/architecture packaging coverage remain engineering checks during implementation. Resolve them using capability detection, accurate unavailable states and documented evidence. They do not authorize claims of universal hardware support or additional product surfaces.
+Provider/runtime availability for Intel, CPU sensor attribution on other machines, exact supported dependency versions, and cross-distribution compatibility remain engineering checks during implementation. Resolve them using capability detection, accurate unavailable states and documented evidence. They do not authorize claims of universal hardware support or additional product surfaces.
 
-The complete settled scope was compared with the existing M1–M3 descriptions at handoff. Those descriptions cover telemetry and tests, the integrated overview and lifecycle, and reliability verification plus publication; no milestone addition or scope edit is needed. No execution work has been delivered by this decision phase. Continue with `implement wf-48ebf7` in a fresh session to prepare and approve the execution plan.
+The original decision handoff mapped telemetry, the integrated overview and reliability verification to M1–M3. The owner later narrowed M3 publication to a public source repository. The current Wayfinder map holds the active milestone and ticket state.

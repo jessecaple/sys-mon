@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=sys-mon
+GenericName=System Monitor
+Comment=Live system resource overview
+Exec=sys-mon
+Icon=io.github.jessecaple.SysMon
+StartupWMClass=sys-mon
+Terminal=false
+Categories=System;Monitor;

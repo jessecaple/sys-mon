@@ -18,6 +18,8 @@ optional; missing hardware or driver libraries leave their readings unavailable
 while the rest of the window works. Sensor and device permissions depend on the
 host. No privileged service is required by the UI.
 
-Run `cargo fmt --check`, `cargo test`, and
-`cargo clippy --all-targets -- -D warnings` to verify a source build. Release
-packages and a tested distribution matrix belong to the later release work.
+Run `cargo fmt --check`, `cargo test --locked`,
+`cargo clippy --all-targets -- -D warnings` and `cargo build --locked` to verify
+a source build. The [README](../README.md) gives current-user installation and
+removal steps, including the desktop entry and icon. Only the environments
+listed there have been checked; no binary packages are published.
