@@ -315,7 +315,7 @@ pub fn run() {
 
 fn run_with_snapshot(snapshot: Option<Snapshot>) {
     let app = adw::Application::builder()
-        .application_id("io.github.sys_mon.SysMon")
+        .application_id("io.github.jessecaple.SysMon")
         .build();
     app.connect_activate(move |app| build_window(app, snapshot.as_ref()));
     app.run_with_args(&["sys-mon"]);
