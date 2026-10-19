@@ -9,6 +9,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 
 import {GROUPS, formatGroups, parseFrame, valueMarkup} from './panel-format.js';
+import {FrameDecoder} from './frame-decoder.js';
 
 const SECONDARY_METRICS = new Set([
     'CPU temp', 'GPU temp', 'VRAM', 'Swap', 'Network up', 'Storage read', 'Storage write', 'Inodes',
@@ -85,29 +86,29 @@ export default class SysMonExtension extends Extension {
             this._process = Gio.Subprocess.new([executable, '--panel-stream'],
                 Gio.SubprocessFlags.STDIN_PIPE | Gio.SubprocessFlags.STDOUT_PIPE |
                 Gio.SubprocessFlags.STDERR_SILENCE);
-            this._input = new Gio.DataInputStream({
-                base_stream: this._process.get_stdout_pipe(), close_base_stream: true,
-            });
+            this._input = this._process.get_stdout_pipe();
             this._lastFrame = GLib.get_monotonic_time();
-            this._readNext(this._input, this._cancellable);
+            this._readNext(this._input, this._cancellable, new FrameDecoder());
         } catch (error) {
             console.error(`sys-mon: ${error.message}`);
             this._backendFailed('Unable to start sys-mon');
         }
     }
 
-    _readNext(input, cancellable) {
-        input.read_line_async(GLib.PRIORITY_LOW, cancellable, (stream, result) => {
+    _readNext(input, cancellable, decoder) {
+        input.read_bytes_async(4096, GLib.PRIORITY_LOW, cancellable, (stream, result) => {
             try {
-                const [line] = stream.read_line_finish_utf8(result);
+                const bytes = stream.read_bytes_finish(result).get_data();
                 if (!this._enabled || cancellable.is_cancelled())
                     return;
-                if (line === null)
+                if (bytes.length === 0)
                     throw new Error('Telemetry process stopped');
-                const cells = parseFrame(line);
-                this._lastFrame = GLib.get_monotonic_time();
-                this._update(cells);
-                this._readNext(input, cancellable);
+                for (const line of decoder.push(bytes)) {
+                    const cells = parseFrame(line);
+                    this._lastFrame = GLib.get_monotonic_time();
+                    this._update(cells);
+                }
+                this._readNext(input, cancellable, decoder);
             } catch (error) {
                 if (!this._enabled || cancellable.is_cancelled())
                     return;

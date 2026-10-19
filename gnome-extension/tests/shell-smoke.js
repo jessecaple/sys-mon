@@ -3,6 +3,7 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import {FrameDecoder, MAX_FRAME_BYTES} from '../frame-decoder.js';
 
 export const METRICS = {};
 const UUID = 'sys-mon@jcaple.dev';
@@ -107,7 +108,24 @@ export async function run() {
     await wait(4500);
     state = Main.extensionManager.lookup(UUID).stateObj;
     check(state._groups[0].values[0].text.includes('%'), 'Re-enable must collect readings');
+
+    // Exercise the production async reader with a finite oversized, unfinished
+    // line in this isolated Shell. Never feed crash fixtures to the live panel.
+    const restartedPid = state._process.get_identifier();
+    state._stopBackend();
+    const input = Gio.MemoryInputStream.new_from_bytes(
+        new GLib.Bytes(new Uint8Array(MAX_FRAME_BYTES + 1).fill(120)));
+    const cancellable = new Gio.Cancellable();
+    state._input = input;
+    state._cancellable = cancellable;
+    state._readNext(input, cancellable, new FrameDecoder());
+    await wait(500);
+    check(cancellable.is_cancelled(), 'Oversized unfinished frame must cancel its read');
+    check(state._retry !== 0 && state._process === null, 'Invalid output must schedule one retry');
+    check(state._groups[0].values[0].text === '—', 'Invalid output must clear readings');
     Main.extensionManager.disableExtension(UUID);
     await wait(1500);
-    print('SYS_MON_SMOKE_OK: readings, fixed slot geometry, display-only behavior, recovery, disable and re-enable');
+    check(!Gio.File.new_for_path(`/proc/${restartedPid}`).query_exists(null), 'Re-enabled backend must exit');
+    check(state._watchdog === 0 && state._retry === 0, 'Disable must cancel invalid-output retry');
+    print('SYS_MON_SMOKE_OK: readings, fixed slot geometry, recovery, bounded async reads, cancellation, disable and re-enable');
 }

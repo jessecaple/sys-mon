@@ -6,6 +6,7 @@
 //! calls belong in killable helpers, as the temperature provider demonstrates.
 
 mod gpu;
+mod helper_output;
 mod io_provider;
 mod linux;
 

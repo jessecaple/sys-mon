@@ -5,7 +5,7 @@ extension_dir="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/sys-m
 cd "$project_dir"
 cargo build --release --locked
 install -d "$extension_dir" "$extension_dir/icons"
-for source in extension.js panel-format.js metadata.json stylesheet.css; do
+for source in extension.js panel-format.js frame-decoder.js metadata.json stylesheet.css; do
     install -m644 "gnome-extension/$source" "$extension_dir/$source"
 done
 install -m644 gnome-extension/icons/*-symbolic.svg "$extension_dir/icons/"

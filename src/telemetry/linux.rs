@@ -3,7 +3,7 @@ use super::{
     TemperatureThreshold, ThresholdKind, UnavailableReason,
 };
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -238,53 +238,29 @@ impl TemperatureProvider {
             Ok(child) => child,
             Err(error) => return Reading::Unavailable(reason_for_io(&error)),
         };
-        let started = Instant::now();
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    if !status.success() {
-                        return Reading::Unavailable(UnavailableReason::SourceError);
-                    }
-                    let mut output = String::new();
-                    let read = child
-                        .stdout
-                        .take()
-                        .map(|stdout| stdout.take(4096).read_to_string(&mut output))
-                        .unwrap_or_else(|| Err(io::Error::other("missing helper output")));
-                    if read.is_err() {
-                        return Reading::Unavailable(UnavailableReason::SourceError);
-                    }
-                    return parse_temperature_line(&output)
-                        .unwrap_or(Reading::Unavailable(UnavailableReason::InvalidData));
-                }
-                Ok(None) => {
-                    if stop.is_stopped() || started.elapsed() >= self.timeout {
-                        let _ = child.kill();
-                        // Reap a normally killable helper without an unbounded
-                        // wait. A driver stuck in uninterruptible kernel sleep
-                        // cannot be reaped promptly; retain only one handle.
-                        let reap_start = Instant::now();
-                        loop {
-                            if matches!(child.try_wait(), Ok(Some(_))) {
-                                break;
-                            }
-                            if reap_start.elapsed() >= Duration::from_millis(100) {
-                                self.unreaped = Some(child);
-                                break;
-                            }
-                            thread::sleep(Duration::from_millis(5));
-                        }
-                        return Reading::Unavailable(UnavailableReason::TimedOut);
-                    }
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Err(_) => {
+        let output =
+            match super::helper_output::read_output(&mut child, self.timeout, 4096, Some(stop)) {
+                Ok(output) => output,
+                Err(reason) => {
                     let _ = child.kill();
-                    self.unreaped = Some(child);
-                    return Reading::Unavailable(UnavailableReason::SourceError);
+                    let reap_started = Instant::now();
+                    loop {
+                        if matches!(child.try_wait(), Ok(Some(_))) {
+                            break;
+                        }
+                        if reap_started.elapsed() >= Duration::from_millis(100) {
+                            self.unreaped = Some(child);
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    return Reading::Unavailable(reason);
                 }
-            }
-        }
+            };
+        std::str::from_utf8(&output)
+            .ok()
+            .and_then(parse_temperature_line)
+            .unwrap_or(Reading::Unavailable(UnavailableReason::InvalidData))
     }
 }
 

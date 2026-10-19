@@ -8,7 +8,7 @@ use super::{
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -300,67 +300,21 @@ impl CapacityHelper {
             Ok(child) => child,
             Err(error) => return CapacityReadings::unavailable(reason_for_io(&error)),
         };
-        let Some(stdout) = child.stdout.as_mut() else {
-            self.terminate(child);
-            return CapacityReadings::unavailable(UnavailableReason::SourceError);
-        };
-        // A helper can fill its pipe before exiting. Drain without blocking so
-        // oversized or stalled output cannot turn the timeout into a deadlock.
-        let fd = stdout.as_raw_fd();
-        // SAFETY: fd belongs to this live child stdout; fcntl only changes its
-        // file status flags and does not retain the descriptor.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-            self.terminate(child);
-            return CapacityReadings::unavailable(UnavailableReason::SourceError);
-        }
-        let started = Instant::now();
-        let mut output = Vec::new();
-        let mut eof = false;
-        let mut status = None;
-        loop {
-            if !eof {
-                let mut buffer = [0_u8; 4096];
-                match child.stdout.as_mut().unwrap().read(&mut buffer) {
-                    Ok(0) => eof = true,
-                    Ok(count) => {
-                        output.extend_from_slice(&buffer[..count]);
-                        if output.len() as u64 > CAPACITY_OUTPUT_LIMIT {
-                            self.terminate(child);
-                            return CapacityReadings::unavailable(UnavailableReason::InvalidData);
-                        }
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(_) => {
-                        self.terminate(child);
-                        return CapacityReadings::unavailable(UnavailableReason::SourceError);
-                    }
-                }
-            }
-            if status.is_none() {
-                match child.try_wait() {
-                    Ok(result) => status = result,
-                    Err(_) => {
-                        self.terminate(child);
-                        return CapacityReadings::unavailable(UnavailableReason::SourceError);
-                    }
-                }
-            }
-            if eof && let Some(status) = status {
-                if !status.success() {
-                    return CapacityReadings::unavailable(UnavailableReason::SourceError);
-                }
-                return serde_json::from_slice(&output)
-                    .map(validate_capacity_readings)
-                    .unwrap_or(CapacityReadings::unavailable(
-                        UnavailableReason::InvalidData,
-                    ));
-            }
-            if started.elapsed() >= self.timeout {
+        match super::helper_output::read_output(
+            &mut child,
+            self.timeout,
+            CAPACITY_OUTPUT_LIMIT as usize,
+            None,
+        ) {
+            Ok(output) => serde_json::from_slice(&output)
+                .map(validate_capacity_readings)
+                .unwrap_or(CapacityReadings::unavailable(
+                    UnavailableReason::InvalidData,
+                )),
+            Err(reason) => {
                 self.terminate(child);
-                return CapacityReadings::unavailable(UnavailableReason::TimedOut);
+                CapacityReadings::unavailable(reason)
             }
-            thread::sleep(Duration::from_millis(5));
         }
     }
 }

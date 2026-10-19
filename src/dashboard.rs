@@ -241,10 +241,10 @@ fn build_window(app: &adw::Application, fixture: Option<&Snapshot>) {
     let session_for_tick = Rc::clone(&session);
     let widgets_for_tick = Rc::clone(&widgets);
     let stopping_for_tick = Rc::clone(&stopping);
-    if fixture.is_none() {
+    let tick_source = if fixture.is_none() {
         let mut averager = SnapshotAverager::default();
         let started = Instant::now();
-        glib::timeout_add_local(Duration::from_secs(1), move || {
+        Some(glib::timeout_add_local(Duration::from_secs(1), move || {
             if stopping_for_tick.get() {
                 return glib::ControlFlow::Break;
             }
@@ -257,22 +257,37 @@ fn build_window(app: &adw::Application, fixture: Option<&Snapshot>) {
                 }
             }
             glib::ControlFlow::Continue
-        });
-    }
+        }))
+    } else {
+        None
+    };
+    let tick_source = RefCell::new(tick_source);
 
-    let app_for_close = app.clone();
+    // The application owns its windows; a window's signal must not own it back.
+    let app_for_close = app.downgrade();
     let session_for_close = Rc::clone(&session);
     window.connect_close_request(move |window| {
         if stopping.replace(true) {
             return glib::Propagation::Stop;
         }
+        if let Some(source) = tick_source.borrow_mut().take() {
+            source.remove();
+        }
         window.set_visible(false);
         let done_rx = stop_in_background(session_for_close.borrow_mut().take());
         let app = app_for_close.clone();
+        let window = window.downgrade();
         glib::timeout_add_local(Duration::from_millis(40), move || {
             match done_rx.try_recv() {
                 Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    app.quit();
+                    // Returning Stop above keeps GTK from destroying the
+                    // window. Release it once the workers have actually stopped.
+                    if let Some(window) = window.upgrade() {
+                        window.destroy();
+                    }
+                    if let Some(app) = app.upgrade() {
+                        app.quit();
+                    }
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -451,5 +466,39 @@ mod tests {
         stop_in_background(None)
             .recv_timeout(Duration::from_millis(100))
             .unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display and D-Bus session"]
+    fn closed_dashboard_releases_its_window_and_application() {
+        gtk::init().unwrap();
+        let app = adw::Application::builder()
+            .application_id("io.github.jessecaple.SysMon.CleanupTest")
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let weak_app = app.downgrade();
+        let mut weak_windows = Vec::new();
+        // A few open/close cycles, using no live telemetry or desktop instance.
+        for _ in 0..3 {
+            build_window(&app, Some(&Snapshot::default()));
+            let window = app.active_window().unwrap();
+            weak_windows.push(window.downgrade());
+            window.close();
+            drop(window);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let context = glib::MainContext::default();
+            while !app.windows().is_empty() && Instant::now() < deadline {
+                context.iteration(false);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(app.windows().is_empty(), "close must destroy the window");
+        }
+        drop(app);
+        assert!(
+            weak_app.upgrade().is_none(),
+            "window signals retained the application"
+        );
+        assert!(weak_windows.iter().all(|window| window.upgrade().is_none()));
     }
 }
