@@ -3,6 +3,9 @@
 A native resource monitor for GNOME. One window shows current CPU, memory,
 GPU, network and storage readings.
 
+The display updates every three seconds, showing the average of fast-changing
+readings collected since the previous update.
+
 ## Run from source
 
 On Fedora, install the build dependencies and run:
