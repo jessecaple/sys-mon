@@ -37,7 +37,10 @@ unavailable while other readings continue updating. Access to `/proc`,
 not shown as dedicated VRAM; GPU usage can remain available when temperature
 or VRAM is not. Primary storage is local capacity backing `/` and `/home`, with
 a shared filesystem shown once. It reports space available to the ordinary
-user and excludes remote or unclassified mounts.
+user and excludes remote or unclassified mounts. The `/tmp` row shows used
+space and used inodes on the filesystem backing `/tmp`, including tmpfs.
+If `/tmp` shares another filesystem, these are filesystem-wide readings.
+A filesystem without a reported inode limit shows inode usage as unavailable.
 
 Live checks used Fedora 44 x86_64, Rust 1.98.1, GTK 4.22.5, libadwaita 1.9.4,
 an Intel Core i9-13900K, NVIDIA RTX 4090 and Btrfs `/` and `/home` subvolumes.

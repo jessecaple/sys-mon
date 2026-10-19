@@ -585,6 +585,8 @@ fn provider_interleaving_preserves_disjoint_fields_and_stop_ends_all_workers() {
                 up_bytes_per_second: Reading::Value(2.0),
             },
             storage: StorageSnapshot {
+                tmp: Reading::Unavailable(UnavailableReason::Missing),
+                tmp_inodes: Reading::Unavailable(UnavailableReason::Missing),
                 read_bytes_per_second: Reading::Value(3.0),
                 write_bytes_per_second: Reading::Value(4.0),
                 primary_volumes: Reading::Value(vec![PrimaryVolume {

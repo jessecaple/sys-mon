@@ -46,6 +46,12 @@ pub struct MemoryAmount {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InodeAmount {
+    pub used: u64,
+    pub total: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ThresholdKind {
     TargetOrMax,
     Critical,
@@ -96,6 +102,8 @@ pub struct StorageSnapshot {
     pub read_bytes_per_second: Reading<f64>,
     pub write_bytes_per_second: Reading<f64>,
     pub primary_volumes: Reading<Vec<PrimaryVolume>>,
+    pub tmp: Reading<MemoryAmount>,
+    pub tmp_inodes: Reading<InodeAmount>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -131,6 +139,8 @@ impl Default for Snapshot {
                 read_bytes_per_second: Reading::Unavailable(missing),
                 write_bytes_per_second: Reading::Unavailable(missing),
                 primary_volumes: Reading::Unavailable(missing),
+                tmp: Reading::Unavailable(missing),
+                tmp_inodes: Reading::Unavailable(missing),
             },
         }
     }
@@ -204,6 +214,8 @@ impl Patch {
                     read_bytes_per_second: Reading::Unavailable(reason),
                     write_bytes_per_second: Reading::Unavailable(reason),
                     primary_volumes: Reading::Unavailable(reason),
+                    tmp: Reading::Unavailable(reason),
+                    tmp_inodes: Reading::Unavailable(reason),
                 },
             }),
         }

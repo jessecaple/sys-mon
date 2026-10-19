@@ -40,6 +40,8 @@ fn glyph(name: &str) -> &'static str {
         "gpu" => "◉",
         "vram" => "▦",
         "storage" => "◫",
+        "tmp" => "▧",
+        "inodes" => "⋮",
         "network-down" => "↓",
         "network-up" => "↑",
         "storage-read" => "↘",
@@ -64,14 +66,14 @@ impl CellWidget {
         if index < 2 {
             body.add_css_class("metric-first-row");
         }
-        if index >= 10 {
+        if index >= 12 {
             body.add_css_class("metric-last-row");
         }
         body.set_hexpand(true);
         Self {
             body,
             last: RefCell::new(None),
-            show_empty_rail: index == 8 || index == 9,
+            show_empty_rail: index == 10 || index == 11,
         }
     }
 
@@ -156,6 +158,7 @@ fn value_label(line: &DisplayLine) -> gtk::Label {
     {
         value.add_css_class("metric-missing");
     }
+    value.set_tooltip_text(Some(&line.description));
     value.update_property(&[gtk::accessible::Property::Label(&line.description)]);
     value
 }
@@ -182,9 +185,9 @@ fn build_window(app: &adw::Application, fixture: Option<&Snapshot>) {
         .application(app)
         .title("sys-mon")
         .default_width(520)
-        .default_height(290)
+        .default_height(335)
         .build();
-    window.set_size_request(520, 290);
+    window.set_size_request(520, 335);
 
     let layout = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let header_handle = gtk::WindowHandle::new();
@@ -203,7 +206,7 @@ fn build_window(app: &adw::Application, fixture: Option<&Snapshot>) {
     grid.add_css_class("dashboard");
     grid.set_hexpand(true);
     grid.set_vexpand(false);
-    let widgets: Rc<Vec<CellWidget>> = Rc::new((0..12).map(CellWidget::new).collect());
+    let widgets: Rc<Vec<CellWidget>> = Rc::new((0..14).map(CellWidget::new).collect());
     for (index, widget) in widgets.iter().enumerate() {
         grid.attach(&widget.body, (index % 2) as i32, (index / 2) as i32, 1, 1);
     }
@@ -310,6 +313,8 @@ fn startup_failed_snapshot() -> Snapshot {
     snapshot.storage.read_bytes_per_second = failed();
     snapshot.storage.write_bytes_per_second = failed();
     snapshot.storage.primary_volumes = failed();
+    snapshot.storage.tmp = failed();
+    snapshot.storage.tmp_inodes = failed();
     snapshot
 }
 
@@ -327,7 +332,7 @@ fn run_with_snapshot(snapshot: Option<Snapshot>) {
 
 #[cfg(debug_assertions)]
 pub fn run_fixture(case: &str) -> Result<(), &'static str> {
-    use crate::telemetry::{MemoryAmount, PrimaryVolume};
+    use crate::telemetry::{InodeAmount, MemoryAmount, PrimaryVolume};
 
     let mut snapshot = Snapshot::default();
     match case {
@@ -343,6 +348,8 @@ pub fn run_fixture(case: &str) -> Result<(), &'static str> {
             snapshot.gpu.temperature = Reading::Unavailable(UnavailableReason::TimedOut);
             snapshot.gpu.vram = Reading::Unavailable(UnavailableReason::Missing);
             snapshot.storage.primary_volumes = Reading::Unavailable(UnavailableReason::Missing);
+            snapshot.storage.tmp = Reading::Unavailable(UnavailableReason::PermissionDenied);
+            snapshot.storage.tmp_inodes = Reading::Unavailable(UnavailableReason::Missing);
             snapshot.network.down_bytes_per_second = Reading::Value(0.0);
             snapshot.network.up_bytes_per_second =
                 Reading::Unavailable(UnavailableReason::WarmingUp);
@@ -351,6 +358,14 @@ pub fn run_fixture(case: &str) -> Result<(), &'static str> {
                 Reading::Unavailable(UnavailableReason::InvalidData);
         }
         "distinct-storage" => {
+            snapshot.storage.tmp = Reading::Value(MemoryAmount {
+                used_bytes: 2 * 1024 * 1024 * 1024,
+                total_bytes: 8 * 1024 * 1024 * 1024,
+            });
+            snapshot.storage.tmp_inodes = Reading::Value(InodeAmount {
+                used: 2500,
+                total: 10_000,
+            });
             snapshot.storage.primary_volumes = Reading::Value(vec![
                 PrimaryVolume {
                     paths: vec!["/".into()],
