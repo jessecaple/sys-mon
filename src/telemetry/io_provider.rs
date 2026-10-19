@@ -2,8 +2,8 @@
 //! counters belong to sources discovered on the immediately preceding tick.
 
 use super::{
-    IoPatch, NetworkSnapshot, Patch, PrimaryVolume, Provider, ProviderKind, Reading, StopToken,
-    StorageSnapshot, UnavailableReason,
+    InodeAmount, IoPatch, MemoryAmount, NetworkSnapshot, Patch, PrimaryVolume, Provider,
+    ProviderKind, Reading, StopToken, StorageSnapshot, UnavailableReason,
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
@@ -64,6 +64,8 @@ struct FsNumbers {
     free: u64,
     available: u64,
     fragment_size: u64,
+    files: u64,
+    free_files: u64,
 }
 
 struct OpenVolume {
@@ -77,10 +79,35 @@ struct VolumeFrame {
     home: Result<OpenVolume, UnavailableReason>,
 }
 
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct CapacityReadings {
+    primary_volumes: Reading<Vec<PrimaryVolume>>,
+    tmp: Reading<MemoryAmount>,
+    tmp_inodes: Reading<InodeAmount>,
+}
+
+impl CapacityReadings {
+    fn unavailable(reason: UnavailableReason) -> Self {
+        Self {
+            primary_volumes: Reading::Unavailable(reason),
+            tmp: Reading::Unavailable(reason),
+            tmp_inodes: Reading::Unavailable(reason),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_primary(primary_volumes: Reading<Vec<PrimaryVolume>>) -> Self {
+        Self {
+            primary_volumes,
+            ..Self::unavailable(UnavailableReason::Missing)
+        }
+    }
+}
+
 trait IoProbe: Send + 'static {
     fn network(&mut self) -> io::Result<NetworkFrame>;
     fn block(&mut self) -> io::Result<Vec<BlockDevice>>;
-    fn capacity(&mut self) -> Reading<Vec<PrimaryVolume>>;
+    fn capacity(&mut self) -> CapacityReadings;
 }
 
 struct LinuxIoProbe {
@@ -185,7 +212,7 @@ impl IoProbe for LinuxIoProbe {
         Ok(devices)
     }
 
-    fn capacity(&mut self) -> Reading<Vec<PrimaryVolume>> {
+    fn capacity(&mut self) -> CapacityReadings {
         self.capacity.sample()
     }
 }
@@ -257,12 +284,12 @@ impl CapacityHelper {
         }
     }
 
-    fn sample(&mut self) -> Reading<Vec<PrimaryVolume>> {
+    fn sample(&mut self) -> CapacityReadings {
         if !self.reap_previous() {
-            return Reading::Unavailable(UnavailableReason::TimedOut);
+            return CapacityReadings::unavailable(UnavailableReason::TimedOut);
         }
         let Some(executable) = &self.executable else {
-            return Reading::Unavailable(UnavailableReason::SourceError);
+            return CapacityReadings::unavailable(UnavailableReason::SourceError);
         };
         let mut child = match Command::new(executable)
             .arg("--internal-capacity-probe")
@@ -271,11 +298,11 @@ impl CapacityHelper {
             .spawn()
         {
             Ok(child) => child,
-            Err(error) => return Reading::Unavailable(reason_for_io(&error)),
+            Err(error) => return CapacityReadings::unavailable(reason_for_io(&error)),
         };
         let Some(stdout) = child.stdout.as_mut() else {
             self.terminate(child);
-            return Reading::Unavailable(UnavailableReason::SourceError);
+            return CapacityReadings::unavailable(UnavailableReason::SourceError);
         };
         // A helper can fill its pipe before exiting. Drain without blocking so
         // oversized or stalled output cannot turn the timeout into a deadlock.
@@ -285,7 +312,7 @@ impl CapacityHelper {
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
             self.terminate(child);
-            return Reading::Unavailable(UnavailableReason::SourceError);
+            return CapacityReadings::unavailable(UnavailableReason::SourceError);
         }
         let started = Instant::now();
         let mut output = Vec::new();
@@ -300,13 +327,13 @@ impl CapacityHelper {
                         output.extend_from_slice(&buffer[..count]);
                         if output.len() as u64 > CAPACITY_OUTPUT_LIMIT {
                             self.terminate(child);
-                            return Reading::Unavailable(UnavailableReason::InvalidData);
+                            return CapacityReadings::unavailable(UnavailableReason::InvalidData);
                         }
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                     Err(_) => {
                         self.terminate(child);
-                        return Reading::Unavailable(UnavailableReason::SourceError);
+                        return CapacityReadings::unavailable(UnavailableReason::SourceError);
                     }
                 }
             }
@@ -315,21 +342,23 @@ impl CapacityHelper {
                     Ok(result) => status = result,
                     Err(_) => {
                         self.terminate(child);
-                        return Reading::Unavailable(UnavailableReason::SourceError);
+                        return CapacityReadings::unavailable(UnavailableReason::SourceError);
                     }
                 }
             }
             if eof && let Some(status) = status {
                 if !status.success() {
-                    return Reading::Unavailable(UnavailableReason::SourceError);
+                    return CapacityReadings::unavailable(UnavailableReason::SourceError);
                 }
                 return serde_json::from_slice(&output)
-                    .map(validate_capacity)
-                    .unwrap_or(Reading::Unavailable(UnavailableReason::InvalidData));
+                    .map(validate_capacity_readings)
+                    .unwrap_or(CapacityReadings::unavailable(
+                        UnavailableReason::InvalidData,
+                    ));
             }
             if started.elapsed() >= self.timeout {
                 self.terminate(child);
-                return Reading::Unavailable(UnavailableReason::TimedOut);
+                return CapacityReadings::unavailable(UnavailableReason::TimedOut);
             }
             thread::sleep(Duration::from_millis(5));
         }
@@ -369,13 +398,71 @@ fn validate_capacity(reading: Reading<Vec<PrimaryVolume>>) -> Reading<Vec<Primar
     }
 }
 
+fn validate_capacity_readings(mut readings: CapacityReadings) -> CapacityReadings {
+    readings.primary_volumes = validate_capacity(readings.primary_volumes);
+    if let Reading::Value(amount) = &readings.tmp
+        && (amount.total_bytes == 0 || amount.used_bytes > amount.total_bytes)
+    {
+        readings.tmp = Reading::Unavailable(UnavailableReason::InvalidData);
+    }
+    if let Reading::Value(amount) = &readings.tmp_inodes
+        && (amount.total == 0 || amount.used > amount.total)
+    {
+        readings.tmp_inodes = Reading::Unavailable(UnavailableReason::InvalidData);
+    }
+    readings
+}
+
 pub fn run_capacity_helper() -> io::Result<()> {
-    let reading = match read_volume_frame() {
+    let mut readings = CapacityReadings::unavailable(UnavailableReason::Missing);
+    readings.primary_volumes = match read_volume_frame() {
         Ok(frame) => primary_volumes(frame),
         Err(error) => Reading::Unavailable(reason_for_io(&error)),
     };
-    serde_json::to_writer(io::stdout().lock(), &reading)?;
+    match read_tmp_numbers() {
+        Ok(numbers) => {
+            (readings.tmp, readings.tmp_inodes) = tmp_usage(&numbers);
+        }
+        Err(error) => {
+            let reason = reason_for_io(&error);
+            readings.tmp = Reading::Unavailable(reason);
+            readings.tmp_inodes = Reading::Unavailable(reason);
+        }
+    }
+    serde_json::to_writer(io::stdout().lock(), &readings)?;
     io::stdout().flush()
+}
+
+// /tmp may be tmpfs or part of another filesystem. Report the capacity of
+// its backing filesystem, as df does, without walking the directory tree.
+fn read_tmp_numbers() -> io::Result<FsNumbers> {
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+    let opened = open_volume("/tmp", &mountinfo)?;
+    opened
+        .numbers
+        .ok_or_else(|| invalid_input("unsupported /tmp filesystem"))
+}
+
+fn tmp_usage(numbers: &FsNumbers) -> (Reading<MemoryAmount>, Reading<InodeAmount>) {
+    let space = match volume_numbers(numbers) {
+        Some((_, used_bytes, total_bytes)) => Reading::Value(MemoryAmount {
+            used_bytes,
+            total_bytes,
+        }),
+        None => Reading::Unavailable(UnavailableReason::InvalidData),
+    };
+    let inodes = if numbers.files == 0 || numbers.files == u64::MAX {
+        // Some filesystems allocate inodes dynamically and expose no limit.
+        Reading::Unavailable(UnavailableReason::Missing)
+    } else if let Some(used) = numbers.files.checked_sub(numbers.free_files) {
+        Reading::Value(InodeAmount {
+            used,
+            total: numbers.files,
+        })
+    } else {
+        Reading::Unavailable(UnavailableReason::InvalidData)
+    };
+    (space, inodes)
 }
 
 fn read_number(path: PathBuf) -> io::Result<u32> {
@@ -415,20 +502,23 @@ fn open_volume(path: &str, mountinfo: &str) -> io::Result<OpenVolume> {
         .ok_or_else(|| invalid_input("missing effective mount identity"))?;
     // Network and unclassified filesystems may block inside fstatvfs. Only
     // ask eligible local storage for its capacity.
-    let numbers = if mount_class(&identity.fs_type) == MountClass::Storage {
-        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstatvfs(file.as_raw_fd(), &mut stat) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Some(FsNumbers {
-            blocks: stat.f_blocks,
-            free: stat.f_bfree,
-            available: stat.f_bavail,
-            fragment_size: stat.f_frsize,
-        })
-    } else {
-        None
-    };
+    let numbers =
+        if mount_class(&identity.fs_type) == MountClass::Storage || identity.fs_type == "tmpfs" {
+            let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstatvfs(file.as_raw_fd(), &mut stat) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Some(FsNumbers {
+                blocks: stat.f_blocks,
+                free: stat.f_bfree,
+                available: stat.f_bavail,
+                fragment_size: stat.f_frsize,
+                files: stat.f_files,
+                free_files: stat.f_ffree,
+            })
+        } else {
+            None
+        };
     Ok(OpenVolume { mount_id, numbers })
 }
 
@@ -762,13 +852,15 @@ impl IoSampler {
     fn tick(&mut self, elapsed: Duration) -> IoPatch {
         let network = self.network(elapsed);
         let (read_bytes_per_second, write_bytes_per_second) = self.block(elapsed);
-        let primary_volumes = self.probe.capacity();
+        let capacity = self.probe.capacity();
         IoPatch {
             network,
             storage: StorageSnapshot {
                 read_bytes_per_second,
                 write_bytes_per_second,
-                primary_volumes,
+                primary_volumes: capacity.primary_volumes,
+                tmp: capacity.tmp,
+                tmp_inodes: capacity.tmp_inodes,
             },
         }
     }
@@ -918,11 +1010,11 @@ mod tests {
         fn block(&mut self) -> io::Result<Vec<BlockDevice>> {
             self.block.pop_front().expect("block frame")
         }
-        fn capacity(&mut self) -> Reading<Vec<PrimaryVolume>> {
-            match self.volumes.pop_front().expect("volume frame") {
+        fn capacity(&mut self) -> CapacityReadings {
+            CapacityReadings::with_primary(match self.volumes.pop_front().expect("volume frame") {
                 Ok(frame) => primary_volumes(frame),
                 Err(error) => Reading::Unavailable(reason_for_io(&error)),
-            }
+            })
         }
     }
 
@@ -982,6 +1074,8 @@ mod tests {
                     free: 30,
                     available: 20,
                     fragment_size: 4096,
+                    files: 1000,
+                    free_files: 900,
                 }),
             }),
             home: Ok(OpenVolume {
@@ -991,9 +1085,117 @@ mod tests {
                     free: 30,
                     available: 20,
                     fragment_size: 4096,
+                    files: 1000,
+                    free_files: 900,
                 }),
             }),
         }
+    }
+
+    #[test]
+    fn tmp_capacity_keeps_space_and_inode_failures_independent() {
+        let mut numbers = FsNumbers {
+            blocks: 100,
+            free: 25,
+            available: 20,
+            fragment_size: 4096,
+            files: 1000,
+            free_files: 900,
+        };
+        let expected_space = Reading::Value(MemoryAmount {
+            used_bytes: 75 * 4096,
+            total_bytes: 100 * 4096,
+        });
+        assert_eq!(
+            tmp_usage(&numbers),
+            (
+                expected_space.clone(),
+                Reading::Value(InodeAmount {
+                    used: 100,
+                    total: 1000
+                })
+            )
+        );
+        numbers.free_files = 0;
+        assert_eq!(
+            tmp_usage(&numbers).1,
+            Reading::Value(InodeAmount {
+                used: 1000,
+                total: 1000
+            })
+        );
+        numbers.free_files = 1000;
+        assert_eq!(
+            tmp_usage(&numbers).1,
+            Reading::Value(InodeAmount {
+                used: 0,
+                total: 1000
+            })
+        );
+        for unknown in [0, u64::MAX] {
+            numbers.files = unknown;
+            assert_eq!(
+                tmp_usage(&numbers),
+                (
+                    expected_space.clone(),
+                    Reading::Unavailable(UnavailableReason::Missing)
+                )
+            );
+        }
+        numbers.files = 100;
+        assert_eq!(
+            tmp_usage(&numbers),
+            (
+                expected_space,
+                Reading::Unavailable(UnavailableReason::InvalidData)
+            )
+        );
+        numbers.free_files = 50;
+        numbers.free = 101;
+        assert_eq!(
+            tmp_usage(&numbers),
+            (
+                Reading::Unavailable(UnavailableReason::InvalidData),
+                Reading::Value(InodeAmount {
+                    used: 50,
+                    total: 100
+                })
+            )
+        );
+    }
+
+    #[test]
+    fn invalid_tmp_helper_fields_do_not_erase_primary_capacity() {
+        let primary = primary_volumes(mounts(43, 63, "/dev/nvme0n1p3", "0:35"));
+        let readings = CapacityReadings {
+            primary_volumes: primary.clone(),
+            tmp: Reading::Value(MemoryAmount {
+                used_bytes: 11,
+                total_bytes: 10,
+            }),
+            tmp_inodes: Reading::Value(InodeAmount {
+                used: 10,
+                total: 100,
+            }),
+        };
+        let readings = validate_capacity_readings(readings);
+        assert_eq!(readings.primary_volumes, primary);
+        assert_eq!(
+            readings.tmp,
+            Reading::Unavailable(UnavailableReason::InvalidData)
+        );
+        assert_eq!(
+            readings.tmp_inodes,
+            Reading::Value(InodeAmount {
+                used: 10,
+                total: 100
+            })
+        );
+        let encoded = serde_json::to_vec(&readings).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<CapacityReadings>(&encoded).unwrap(),
+            readings
+        );
     }
 
     fn numbers_mut(opened: &mut Result<OpenVolume, UnavailableReason>) -> &mut FsNumbers {
@@ -1298,8 +1500,13 @@ mod tests {
                 )])
             }
 
-            fn capacity(&mut self) -> Reading<Vec<PrimaryVolume>> {
-                primary_volumes(mounts(43, 63, "/dev/nvme0n1p3", "0:35"))
+            fn capacity(&mut self) -> CapacityReadings {
+                CapacityReadings::with_primary(primary_volumes(mounts(
+                    43,
+                    63,
+                    "/dev/nvme0n1p3",
+                    "0:35",
+                )))
             }
         }
 
@@ -1342,7 +1549,7 @@ mod tests {
                 Ok(minimal_blocks(sample * 100, sample * 200))
             }
 
-            fn capacity(&mut self) -> Reading<Vec<PrimaryVolume>> {
+            fn capacity(&mut self) -> CapacityReadings {
                 self.helper.sample()
             }
         }
@@ -1366,7 +1573,11 @@ mod tests {
             used_bytes: 70,
             total_bytes: 100,
         }]);
-        fs::write(&payload, serde_json::to_vec(&good).unwrap()).unwrap();
+        fs::write(
+            &payload,
+            serde_json::to_vec(&CapacityReadings::with_primary(good.clone())).unwrap(),
+        )
+        .unwrap();
         let mut sampler = IoSampler::new(HelperProbe {
             helper: CapacityHelper::with_executable(script, Duration::from_millis(200)),
             sample: 0,
@@ -1399,7 +1610,11 @@ mod tests {
             Reading::Value(200.0)
         );
 
-        fs::write(&payload, serde_json::to_vec(&good).unwrap()).unwrap();
+        fs::write(
+            &payload,
+            serde_json::to_vec(&CapacityReadings::with_primary(good.clone())).unwrap(),
+        )
+        .unwrap();
         let recovered = sampler.tick(Duration::from_secs(3));
         assert_eq!(recovered.storage.primary_volumes, good);
         assert_eq!(
@@ -1483,12 +1698,16 @@ mod tests {
             used_bytes: 70,
             total_bytes: 100,
         }]);
-        fs::write(&payload, serde_json::to_vec(&good).unwrap()).unwrap();
+        fs::write(
+            &payload,
+            serde_json::to_vec(&CapacityReadings::with_primary(good.clone())).unwrap(),
+        )
+        .unwrap();
         fs::write(&marker, "stall").unwrap();
         let mut helper = CapacityHelper::with_executable(script, Duration::from_millis(60));
         for attempt in 1..=5 {
             assert_eq!(
-                helper.sample(),
+                helper.sample().primary_volumes,
                 Reading::Unavailable(UnavailableReason::TimedOut)
             );
             let recorded = fs::read_to_string(&pids).unwrap();
@@ -1502,7 +1721,7 @@ mod tests {
             );
         }
         fs::remove_file(marker).unwrap();
-        assert_eq!(helper.sample(), good);
+        assert_eq!(helper.sample().primary_volumes, good);
         assert_eq!(fs::read_to_string(&pids).unwrap().lines().count(), 6);
         fs::remove_dir_all(root).unwrap();
     }
@@ -1520,7 +1739,7 @@ mod tests {
             Ok(minimal_blocks(0, 0))
         }
 
-        fn capacity(&mut self) -> Reading<Vec<PrimaryVolume>> {
+        fn capacity(&mut self) -> CapacityReadings {
             self.helper.sample()
         }
     }
@@ -1809,7 +2028,7 @@ mod tests {
             let number = *self.ticks.lock().unwrap();
             Ok(minimal_blocks(number * 512, number * 1024))
         }
-        fn capacity(&mut self) -> Reading<Vec<PrimaryVolume>> {
+        fn capacity(&mut self) -> CapacityReadings {
             let mode = self.volume_mode.load(Ordering::SeqCst);
             let mut frame = if mode == 0 || mode == 4 {
                 mounts(43, 63, "/dev/nvme0n1p3", "0:35")
@@ -1830,7 +2049,7 @@ mod tests {
                 frame.root = Err(UnavailableReason::PermissionDenied);
                 numbers_mut(&mut frame.home).available = 5;
             }
-            primary_volumes(frame)
+            CapacityReadings::with_primary(primary_volumes(frame))
         }
     }
 

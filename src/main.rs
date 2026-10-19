@@ -4,6 +4,14 @@ use sys_mon::telemetry::{
 };
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--panel-stream") {
+        if let Err(error) = sys_mon::panel::run_stream() {
+            eprintln!("panel telemetry failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if std::env::args().nth(1).as_deref() == Some("--internal-temperature-probe") {
         if let Err(error) = run_temperature_helper() {
             eprintln!("temperature probe failed: {error}");

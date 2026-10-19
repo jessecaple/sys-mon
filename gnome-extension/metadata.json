@@ -1,0 +1,8 @@
+{
+  "uuid": "sys-mon@jcaple.dev",
+  "name": "sys-mon",
+  "description": "Compact grouped resource readings in the GNOME top bar.",
+  "shell-version": ["50"],
+  "url": "https://github.com/jessecaple/sys-mon",
+  "version": 1
+}
