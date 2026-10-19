@@ -472,33 +472,44 @@ mod tests {
     #[ignore = "requires an isolated GTK display and D-Bus session"]
     fn closed_dashboard_releases_its_window_and_application() {
         gtk::init().unwrap();
-        let app = adw::Application::builder()
-            .application_id("io.github.jessecaple.SysMon.CleanupTest")
-            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
-            .build();
-        app.register(None::<&gtk::gio::Cancellable>).unwrap();
-        let weak_app = app.downgrade();
-        let mut weak_windows = Vec::new();
-        // A few open/close cycles, using no live telemetry or desktop instance.
+        // Registration exports application objects on D-Bus; run the normal
+        // lifecycle so shutdown also unregisters them before checking release.
         for _ in 0..3 {
-            build_window(&app, Some(&Snapshot::default()));
-            let window = app.active_window().unwrap();
-            weak_windows.push(window.downgrade());
-            window.close();
-            drop(window);
-            let deadline = Instant::now() + Duration::from_secs(2);
-            let context = glib::MainContext::default();
-            while !app.windows().is_empty() && Instant::now() < deadline {
-                context.iteration(false);
-                std::thread::sleep(Duration::from_millis(2));
-            }
+            let app = adw::Application::builder()
+                .application_id("io.github.jessecaple.SysMon.CleanupTest")
+                .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+                .build();
+            let weak_app = app.downgrade();
+            let windows = Rc::new(RefCell::new(Vec::new()));
+            let windows_for_activate = Rc::clone(&windows);
+            app.connect_activate(move |app| {
+                build_window(app, Some(&Snapshot::default()));
+                let window = app.active_window().unwrap();
+                windows_for_activate.borrow_mut().push(window.downgrade());
+                window.close();
+            });
+            let weak_app_for_deadline = app.downgrade();
+            let deadline = glib::timeout_add_local(Duration::from_secs(2), move || {
+                if let Some(app) = weak_app_for_deadline.upgrade() {
+                    app.quit();
+                }
+                glib::ControlFlow::Continue
+            });
+            app.run_with_args(&["sys-mon-cleanup-test"]);
+            deadline.remove();
             assert!(app.windows().is_empty(), "close must destroy the window");
+            assert_eq!(windows.borrow().len(), 1);
+            drop(app);
+            assert!(
+                weak_app.upgrade().is_none(),
+                "application was retained after shutdown"
+            );
+            assert!(
+                windows
+                    .borrow()
+                    .iter()
+                    .all(|window| window.upgrade().is_none())
+            );
         }
-        drop(app);
-        assert!(
-            weak_app.upgrade().is_none(),
-            "window signals retained the application"
-        );
-        assert!(weak_windows.iter().all(|window| window.upgrade().is_none()));
     }
 }
