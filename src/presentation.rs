@@ -1,20 +1,21 @@
 //! Current-only text and rail semantics for the native dashboard.
 
 use crate::telemetry::{
-    MemoryAmount, PrimaryVolume, Reading, Snapshot, Temperature, ThresholdKind, UnavailableReason,
+    InodeAmount, MemoryAmount, PrimaryVolume, Reading, Snapshot, Temperature, ThresholdKind,
+    UnavailableReason,
 };
 
 mod averaging;
 pub(crate) use averaging::SnapshotAverager;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct DisplayLine {
     pub value: String,
     pub description: String,
     pub rail: Option<f64>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct Cell {
     pub label: &'static str,
     pub glyph: &'static str,
@@ -133,6 +134,30 @@ fn memory(label: &str, reading: &Reading<MemoryAmount>) -> DisplayLine {
     }
 }
 
+fn inodes(reading: &Reading<InodeAmount>) -> DisplayLine {
+    match reading {
+        Reading::Value(amount) if amount.total > 0 && amount.used <= amount.total => {
+            let value = if amount.used < 1000 {
+                amount.used.to_string()
+            } else if amount.used < 1_000_000 {
+                format!("{:.1}K", amount.used as f64 / 1000.0)
+            } else {
+                format!("{:.1}M", amount.used as f64 / 1_000_000.0)
+            };
+            value_line(
+                value,
+                format!(
+                    "/tmp inodes: {} used of {} total",
+                    amount.used, amount.total
+                ),
+                Some(amount.used as f64 / amount.total as f64),
+            )
+        }
+        Reading::Value(_) => unavailable("/tmp inodes", UnavailableReason::InvalidData),
+        Reading::Unavailable(reason) => unavailable("/tmp inodes", *reason),
+    }
+}
+
 fn temperature(label: &str, reading: &Reading<Temperature>) -> DisplayLine {
     match reading {
         Reading::Value(temp) => {
@@ -207,8 +232,8 @@ fn storage(reading: &Reading<Vec<PrimaryVolume>>) -> Vec<DisplayLine> {
     }
 }
 
-/// Row-major order, matching the approved six-row overview.
-pub fn present(snapshot: &Snapshot) -> [Cell; 12] {
+/// Row-major order for the two-column overview.
+pub fn present(snapshot: &Snapshot) -> [Cell; 14] {
     [
         Cell::one("CPU", "cpu", percent("CPU", &snapshot.cpu.usage_percent)),
         Cell::one(
@@ -230,6 +255,12 @@ pub fn present(snapshot: &Snapshot) -> [Cell; 12] {
             glyph: "storage",
             lines: storage(&snapshot.storage.primary_volumes),
         },
+        Cell::one(
+            "/tmp",
+            "tmp",
+            memory("/tmp filesystem", &snapshot.storage.tmp),
+        ),
+        Cell::one("Inodes", "inodes", inodes(&snapshot.storage.tmp_inodes)),
         Cell::one(
             "Network down",
             "network-down",
@@ -422,16 +453,18 @@ mod tests {
                 "GPU temp",
                 "VRAM",
                 "Storage",
+                "/tmp",
+                "Inodes",
                 "Network down",
                 "Network up",
                 "Storage read",
                 "Storage write",
             ]
         );
-        assert_eq!(cells[8].lines[0].value, "0 B/s");
-        assert!(cells[8].lines[0].rail.is_none());
-        assert_eq!(cells[10].lines[0].value, "1.0 MiB/s");
+        assert_eq!(cells[10].lines[0].value, "0 B/s");
         assert!(cells[10].lines[0].rail.is_none());
+        assert_eq!(cells[12].lines[0].value, "1.0 MiB/s");
+        assert!(cells[12].lines[0].rail.is_none());
     }
 
     #[test]
@@ -442,8 +475,51 @@ mod tests {
         let cells = present(&snapshot);
         assert_eq!(cells[0].lines[0].value, "<0.1%");
         assert!(cells[0].lines[0].description.contains("0.04 percent"));
-        assert_eq!(cells[8].lines[0].value, "<1 B/s");
+        assert_eq!(cells[10].lines[0].value, "<1 B/s");
         snapshot.cpu.usage_percent = Reading::Value(0.5);
         assert_eq!(present(&snapshot)[0].lines[0].value, "0.5%");
+    }
+    #[test]
+    fn tmp_space_and_inodes_show_used_amounts_with_independent_rails() {
+        let mut snapshot = Snapshot::default();
+        snapshot.storage.tmp = Reading::Value(MemoryAmount {
+            used_bytes: 2 * 1024 * 1024 * 1024,
+            total_bytes: 8 * 1024 * 1024 * 1024,
+        });
+        snapshot.storage.tmp_inodes = Reading::Value(InodeAmount {
+            used: 2500,
+            total: 10_000,
+        });
+        let cells = present(&snapshot);
+        assert_eq!(cells[8].label, "/tmp");
+        assert_eq!(cells[8].lines[0].value, "2.0 GiB");
+        assert_eq!(cells[8].lines[0].rail, Some(0.25));
+        assert_eq!(cells[9].label, "Inodes");
+        assert_eq!(cells[9].lines[0].value, "2.5K");
+        assert_eq!(cells[9].lines[0].rail, Some(0.25));
+        assert_eq!(
+            cells[9].lines[0].description,
+            "/tmp inodes: 2500 used of 10000 total"
+        );
+
+        snapshot.storage.tmp_inodes = Reading::Unavailable(UnavailableReason::Missing);
+        let cells = present(&snapshot);
+        assert_eq!(cells[8].lines[0].value, "2.0 GiB");
+        assert_eq!(cells[9].lines[0].value, "Unavailable");
+        assert!(cells[9].lines[0].rail.is_none());
+    }
+
+    #[test]
+    fn inode_zero_full_and_invalid_values_remain_distinct() {
+        for (used, total, text, rail) in [
+            (0, 100, "0", Some(0.0)),
+            (100, 100, "100", Some(1.0)),
+            (1, 0, "Invalid reading", None),
+            (101, 100, "Invalid reading", None),
+        ] {
+            let line = inodes(&Reading::Value(InodeAmount { used, total }));
+            assert_eq!(line.value, text);
+            assert_eq!(line.rail, rail);
+        }
     }
 }

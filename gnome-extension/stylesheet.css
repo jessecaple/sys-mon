@@ -1,0 +1,25 @@
+.sys-mon-strip { spacing: 28px; }
+.sys-mon-group { spacing: 0; }
+.sys-mon-values,
+.sys-mon-separator { font-family: "Source Code Pro", monospace; }
+.sys-mon-glyph { color: rgba(255, 255, 255, 0.8); }
+#panel .sys-mon-panel-button .sys-mon-group .sys-mon-glyph {
+    icon-size: 16px;
+    padding: 0;
+    margin: 0 6px 0 0;
+}
+.sys-mon-separator {
+    color: rgba(255, 255, 255, 0.36);
+    font-weight: 400;
+    padding: 0;
+}
+.sys-mon-values {
+    color: rgba(255, 255, 255, 0.92);
+    font-weight: 500;
+    font-feature-settings: "tnum";
+}
+.sys-mon-values.sys-mon-secondary { color: rgba(255, 255, 255, 0.68); }
+.sys-mon-values.sys-mon-rate {
+    font-weight: 400;
+}
+.sys-mon-values.sys-mon-rate.sys-mon-secondary { color: rgba(255, 255, 255, 0.62); }
