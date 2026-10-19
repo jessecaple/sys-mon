@@ -12,7 +12,7 @@ use nvml_wrapper::enum_wrappers::device::{
 };
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -149,54 +149,34 @@ impl GpuProvider {
             Ok(child) => child,
             Err(error) => return unavailable(io_reason(&error)),
         };
-        let started = Instant::now();
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    if !status.success() {
-                        return unavailable(UnavailableReason::SourceError);
+        let output = match super::helper_output::read_output(
+            &mut child,
+            self.timeout,
+            MAX_OUTPUT as usize,
+            Some(stop),
+        ) {
+            Ok(output) => output,
+            Err(reason) => {
+                let _ = child.kill();
+                let reap_started = Instant::now();
+                loop {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        break;
                     }
-                    let mut output = Vec::new();
-                    let read = child
-                        .stdout
-                        .take()
-                        .map(|stdout| stdout.take(MAX_OUTPUT + 1).read_to_end(&mut output))
-                        .unwrap_or_else(|| Err(io::Error::other("missing GPU helper output")));
-                    if read.is_err() || output.len() as u64 > MAX_OUTPUT {
-                        return unavailable(UnavailableReason::InvalidData);
-                    }
-                    let frames: Vec<DeviceFrame> =
-                        match serde_json::from_slice::<Vec<DeviceFrame>>(&output) {
-                            Ok(frames) if frames.len() <= MAX_DEVICES * 3 => frames,
-                            _ => return unavailable(UnavailableReason::InvalidData),
-                        };
-                    return selected_patch(frames);
-                }
-                Ok(None) => {
-                    if stop.is_stopped() || started.elapsed() >= self.timeout {
-                        let _ = child.kill();
-                        let reap_started = Instant::now();
-                        loop {
-                            if matches!(child.try_wait(), Ok(Some(_))) {
-                                break;
-                            }
-                            if reap_started.elapsed() >= Duration::from_millis(100) {
-                                self.unreaped = Some(child);
-                                break;
-                            }
-                            thread::sleep(Duration::from_millis(5));
-                        }
-                        return unavailable(UnavailableReason::TimedOut);
+                    if reap_started.elapsed() >= Duration::from_millis(100) {
+                        self.unreaped = Some(child);
+                        break;
                     }
                     thread::sleep(Duration::from_millis(5));
                 }
-                Err(_) => {
-                    let _ = child.kill();
-                    self.unreaped = Some(child);
-                    return unavailable(UnavailableReason::SourceError);
-                }
+                return unavailable(reason);
             }
-        }
+        };
+        let frames: Vec<DeviceFrame> = match serde_json::from_slice::<Vec<DeviceFrame>>(&output) {
+            Ok(frames) if frames.len() <= MAX_DEVICES * 3 => frames,
+            _ => return unavailable(UnavailableReason::InvalidData),
+        };
+        selected_patch(frames)
     }
 }
 

@@ -78,6 +78,10 @@ shutdown and joins the telemetry workers. Shell reads stdout asynchronously.
 A failed process clears the values and is retried after five seconds; stale
 readings are cleared after ten seconds. Disabling removes actors, timers,
 and both process pipes, including cancellation of pending reads.
+Shell reads in 4 KiB chunks and rejects a frame larger than 64 KiB before JSON
+decoding, including unfinished lines. GPU, temperature and capacity helper
+output is drained with bounded nonblocking reads so pipe EOF cannot prevent
+timeout or worker shutdown.
 
 ```sh
 cargo fmt --check
