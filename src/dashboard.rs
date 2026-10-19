@@ -2,12 +2,12 @@
 
 use std::cell::{Cell as LocalCell, RefCell};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use gtk::glib;
 
-use crate::presentation::{Cell, DisplayLine, present};
+use crate::presentation::{Cell, DisplayLine, SnapshotAverager, present};
 use crate::telemetry::{Reading, Snapshot, TelemetrySession, UnavailableReason};
 
 const STYLE: &str = r#"
@@ -239,12 +239,16 @@ fn build_window(app: &adw::Application, fixture: Option<&Snapshot>) {
     let widgets_for_tick = Rc::clone(&widgets);
     let stopping_for_tick = Rc::clone(&stopping);
     if fixture.is_none() {
+        let mut averager = SnapshotAverager::default();
+        let started = Instant::now();
         glib::timeout_add_local(Duration::from_secs(1), move || {
             if stopping_for_tick.get() {
                 return glib::ControlFlow::Break;
             }
-            if let Some(session) = session_for_tick.borrow().as_ref() {
-                let cells = present(&session.snapshot());
+            if let Some(session) = session_for_tick.borrow().as_ref()
+                && let Some(snapshot) = averager.update(started.elapsed(), session.snapshot())
+            {
+                let cells = present(&snapshot);
                 for (widget, cell) in widgets_for_tick.iter().zip(cells.iter()) {
                     widget.update(cell);
                 }

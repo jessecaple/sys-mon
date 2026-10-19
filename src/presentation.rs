@@ -4,6 +4,9 @@ use crate::telemetry::{
     MemoryAmount, PrimaryVolume, Reading, Snapshot, Temperature, ThresholdKind, UnavailableReason,
 };
 
+mod averaging;
+pub(crate) use averaging::SnapshotAverager;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct DisplayLine {
     pub value: String,

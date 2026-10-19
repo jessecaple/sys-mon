@@ -97,9 +97,18 @@ A newly discovered or reset counter needs a fresh baseline before reporting a ra
 
 Use a one-second refresh for changing readings as the initial engineering default. Slow-changing discovery or capacity checks may run less often on a bounded schedule. This default does not introduce a polling-settings surface.
 
+The owner's 2026-10-18 update changes the display cadence to three seconds.
+Continue collecting on the existing one-second timer, then display the average
+of readings since the previous display update. The windows do not overlap;
+retain at most three snapshots and discard samples older than three seconds.
+Apply averaging to usage, temperature, memory use and throughput; primary storage
+capacity remains the latest reported value. The latest failure or invalid reading
+appears at the next display update. Recovery, sensor changes and memory-capacity
+changes start fresh averages for that field. Do not animate number changes.
+
 Sleep between collection opportunities. Prevent overlapping work for a provider, catch-up polling queues and unbounded retry loops. Deliver current snapshots through bounded/coalescing transport so a busy UI does not accumulate obsolete updates. Redraw in response to current data and actual display changes, without continuous decorative animation.
 
-Retain current readings, previous counters needed for rates, and current discovery state. Remove obsolete device state. Work, diagnostics and memory must not grow with elapsed runtime or repeated device churn; state may scale with devices currently discovered. There are no historical series to retain.
+Retain current readings, previous counters needed for rates, current discovery state and at most three temporary UI snapshots for the display average. Remove obsolete device state. Work, diagnostics and memory must not grow with elapsed runtime or repeated device churn; state may scale with devices currently discovered. There are no long-term historical series to retain.
 
 Run potentially blocking work outside the GTK main loop. Failure of one source must leave unrelated sources and the window usable. Replace invalid readings with unavailable status rather than keeping stale values presented as current. Recover automatically at a bounded retry pace; rate recovery requires a fresh baseline.
 
