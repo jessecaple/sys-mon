@@ -241,10 +241,10 @@ fn build_window(app: &adw::Application, fixture: Option<&Snapshot>) {
     let session_for_tick = Rc::clone(&session);
     let widgets_for_tick = Rc::clone(&widgets);
     let stopping_for_tick = Rc::clone(&stopping);
-    if fixture.is_none() {
+    let tick_source = if fixture.is_none() {
         let mut averager = SnapshotAverager::default();
         let started = Instant::now();
-        glib::timeout_add_local(Duration::from_secs(1), move || {
+        Some(glib::timeout_add_local(Duration::from_secs(1), move || {
             if stopping_for_tick.get() {
                 return glib::ControlFlow::Break;
             }
@@ -257,22 +257,37 @@ fn build_window(app: &adw::Application, fixture: Option<&Snapshot>) {
                 }
             }
             glib::ControlFlow::Continue
-        });
-    }
+        }))
+    } else {
+        None
+    };
+    let tick_source = RefCell::new(tick_source);
 
-    let app_for_close = app.clone();
+    // The application owns its windows; a window's signal must not own it back.
+    let app_for_close = app.downgrade();
     let session_for_close = Rc::clone(&session);
     window.connect_close_request(move |window| {
         if stopping.replace(true) {
             return glib::Propagation::Stop;
         }
+        if let Some(source) = tick_source.borrow_mut().take() {
+            source.remove();
+        }
         window.set_visible(false);
         let done_rx = stop_in_background(session_for_close.borrow_mut().take());
         let app = app_for_close.clone();
+        let window = window.downgrade();
         glib::timeout_add_local(Duration::from_millis(40), move || {
             match done_rx.try_recv() {
                 Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    app.quit();
+                    // Returning Stop above keeps GTK from destroying the
+                    // window. Release it once the workers have actually stopped.
+                    if let Some(window) = window.upgrade() {
+                        window.destroy();
+                    }
+                    if let Some(app) = app.upgrade() {
+                        app.quit();
+                    }
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -451,5 +466,50 @@ mod tests {
         stop_in_background(None)
             .recv_timeout(Duration::from_millis(100))
             .unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GTK display and D-Bus session"]
+    fn closed_dashboard_releases_its_window_and_application() {
+        gtk::init().unwrap();
+        // Registration exports application objects on D-Bus; run the normal
+        // lifecycle so shutdown also unregisters them before checking release.
+        for _ in 0..3 {
+            let app = adw::Application::builder()
+                .application_id("io.github.jessecaple.SysMon.CleanupTest")
+                .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+                .build();
+            let weak_app = app.downgrade();
+            let windows = Rc::new(RefCell::new(Vec::new()));
+            let windows_for_activate = Rc::clone(&windows);
+            app.connect_activate(move |app| {
+                build_window(app, Some(&Snapshot::default()));
+                let window = app.active_window().unwrap();
+                windows_for_activate.borrow_mut().push(window.downgrade());
+                window.close();
+            });
+            let weak_app_for_deadline = app.downgrade();
+            let deadline = glib::timeout_add_local(Duration::from_secs(2), move || {
+                if let Some(app) = weak_app_for_deadline.upgrade() {
+                    app.quit();
+                }
+                glib::ControlFlow::Continue
+            });
+            app.run_with_args(&["sys-mon-cleanup-test"]);
+            deadline.remove();
+            assert!(app.windows().is_empty(), "close must destroy the window");
+            assert_eq!(windows.borrow().len(), 1);
+            drop(app);
+            assert!(
+                weak_app.upgrade().is_none(),
+                "application was retained after shutdown"
+            );
+            assert!(
+                windows
+                    .borrow()
+                    .iter()
+                    .all(|window| window.upgrade().is_none())
+            );
+        }
     }
 }
