@@ -26,6 +26,7 @@ The ordinary overview follows this row order:
 | RAM used | Swap used |
 | GPU usage | GPU temperature |
 | VRAM used | Primary storage remaining |
+| /tmp filesystem used | /tmp inodes used |
 | Network down | Network up |
 | Storage read | Storage write |
 
@@ -68,7 +69,7 @@ Use strong readable values, quieter labels, distinct decorative glyphs and align
 
 RAM, swap and VRAM display only their current used amounts with abbreviated units; their totals inform rails and accessible descriptions. CPU/GPU usage is a percentage. Temperature shows the current value and uses a hardware-reported max or target threshold for its rail when available. Clamp the visual rail without falsifying the text. Do not display endpoint labels. A valid temperature without a valid threshold still has valid text; do not invent a universal scale. The prototype's 80 °C CPU and 84 °C GPU thresholds describe the owner's hardware, not all systems.
 
-The visible **Storage** value means remaining capacity. Its rail represents used capacity, as in the approved prototype, and its accessible description makes both meanings clear. Do not append a visible “free” qualifier. Throughput uses separate **Network down**, **Network up**, **Storage read** and **Storage write** cells; rates do not receive invented maximum-capacity rails. The owner approved the later compact UI as shown on 2026-10-06, including the gray bottom tracks under Network down and Network up. Those tracks are decorative: they have no fill, value or implied maximum. Storage read and Storage write have no track.
+The visible **Storage** value means remaining capacity. Its rail represents used capacity, as in the approved prototype, and its accessible description makes both meanings clear. Do not append a visible “free” qualifier. `/tmp` displays used space on its backing filesystem (including tmpfs), and **Inodes** displays used inodes on that same filesystem. Both rails show the used fraction, with exact used and total values in hover and accessible descriptions. Filesystems without a reported inode limit show unavailable for inodes. Throughput uses separate **Network down**, **Network up**, **Storage read** and **Storage write** cells; rates do not receive invented maximum-capacity rails. The owner approved the later compact UI as shown on 2026-10-06, including the gray bottom tracks under Network down and Network up. Those tracks are decorative: they have no fill, value or implied maximum. Storage read and Storage write have no track.
 
 Use accessible text for unavailable states and meaningful descriptions of values, units and rail scales. A glyph supplements its text label. Preserve true zero readings, and never divide by zero or claim a capacity percentage when total capacity is unknown or zero.
 
@@ -168,3 +169,25 @@ Evidence references:
 Provider/runtime availability for Intel, CPU sensor attribution on other machines, exact supported dependency versions, and cross-distribution compatibility remain engineering checks during implementation. Resolve them using capability detection, accurate unavailable states and documented evidence. They do not authorize claims of universal hardware support or additional product surfaces.
 
 The original decision handoff mapped telemetry, the integrated overview and reliability verification to M1–M3. The owner later narrowed M3 publication to a public source repository. The current Wayfinder map holds the active milestone and ticket state.
+
+## GNOME panel presentation (owner request, 2026-10-19)
+
+The top-bar extension presents the same fourteen metrics after the workspace
+switcher, in the panel's left area. Use native panel styling and one glyph per
+group, in order: CPU use/temperature; GPU use/VRAM/temperature; RAM/swap;
+primary storage remaining/read/write; `/tmp` used space/inodes; network down/up.
+Separate values with slashes and reserve a fixed width for each value so digit
+changes do not shift neighboring readings. On the panel, RAM, swap, VRAM, `/tmp`
+space and `/tmp` inodes show percentage used; primary storage shows percentage
+remaining. Use two-digit whole percentages capped at 99; unknown capacity is
+unavailable. Temperatures stay in Celsius, with values above 99 °C as `99+°`.
+Keep actual amounts, percentages and full readings in accessible descriptions. Zero-pad percentages and temperatures to two digits and speeds to
+three digits; preserve tiny-positive markers (`<1%`, `<01B`). Omit `/s` from visible speeds.
+Use Source Code Pro readings and slashes (monospace fallback) with slots closely
+fitted to padded text; render padding zeros at half opacity while retaining
+normal brightness for significant digits. Use
+medium-weight primary values, quieter secondary readings and faint slashes.
+The strip is display-only: no click menu, hover popup, hover brightening or
+keyboard focus. Full labels, units and totals remain in accessible descriptions. Keep the calendar
+in GNOME's center area. The native window remains available as a secondary
+presentation. See [the extension guide](../gnome-extension/README.md).
